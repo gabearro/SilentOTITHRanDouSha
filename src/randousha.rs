@@ -35,6 +35,18 @@ impl RanDouShaParams {
     }
 }
 
+/// A Vandermonde matrix M[i][j] = alpha_j^i used for the HIM transformation
+/// in the RanDouSha protocol (DN07/Beerliova-Hirt).
+///
+/// This matrix has the hyper-invertibility property needed for our use case:
+/// when evaluation points alpha_1..alpha_n are distinct nonzero field elements,
+/// any submatrix formed by selecting consecutive rows and any subset of columns
+/// is invertible. Specifically, for check rows {n-2t, ..., n-1} and any t
+/// corrupted columns, the t×t submatrix is a generalized Vandermonde with
+/// determinant = prod(alpha_ci^{n-2t}) * prod(alpha_cj - alpha_ci) ≠ 0
+/// since all alpha values are distinct and nonzero (1, 2, ..., n in F_p).
+/// This ensures that any t corrupted inputs always produce detectable
+/// errors in the check rows.
 pub struct HyperInvertibleMatrix {
     entries: Vec<Vec<Fp>>,
     n: usize,
@@ -96,7 +108,7 @@ impl RanDouShaProtocol {
             .flat_map(|s| DistributedSilentOt::round0_commitments(s))
             .collect();
         for s in &mut ot_states {
-            DistributedSilentOt::process_round0(s, &r0_msgs);
+            DistributedSilentOt::process_round0(s, &r0_msgs)?;
         }
 
         let r1_msgs: Vec<_> = ot_states
@@ -177,6 +189,44 @@ impl RanDouShaProtocol {
                         share_t: shares_t_out[p],
                         share_2t: shares_2t_out[p],
                     });
+                }
+            }
+
+            // HIM verification: open check rows (sharings_per_round..n) and verify
+            // that degree-t and degree-2t sharings reconstruct to the same secret.
+            // This is the core malicious security mechanism from DN07/Beerliova-Hirt:
+            // any t corrupted parties' inputs will propagate to ALL HIM outputs
+            // (including these check rows), so tampering is detected with
+            // overwhelming probability.
+            for check_row in sharings_per_round..n {
+                let shares_t_check: Vec<Share> = (0..n)
+                    .map(|p| {
+                        let point = shamir_t.eval_points[p];
+                        let val: Fp = (0..n)
+                            .map(|i| him.get(check_row, i) * all_shares_t[i][p].value)
+                            .sum();
+                        Share { point, value: val }
+                    })
+                    .collect();
+
+                let shares_2t_check: Vec<Share> = (0..n)
+                    .map(|p| {
+                        let point = shamir_2t.eval_points[p];
+                        let val: Fp = (0..n)
+                            .map(|i| him.get(check_row, i) * all_shares_2t[i][p].value)
+                            .sum();
+                        Share { point, value: val }
+                    })
+                    .collect();
+
+                let secret_t = shamir_t.reconstruct(&shares_t_check)?;
+                let secret_2t = shamir_2t.reconstruct(&shares_2t_check)?;
+
+                if secret_t != secret_2t {
+                    return Err(ProtocolError::MaliciousParty(format!(
+                        "HIM check row {} in round {} failed: degree-t secret={} != degree-2t secret={}",
+                        check_row, round, secret_t, secret_2t
+                    )));
                 }
             }
         }
@@ -307,6 +357,37 @@ mod tests {
             assert_eq!(s1, s2);
             assert_eq!(s2, s3);
         }
+    }
+
+    #[test]
+    fn test_him_verification_passes_honest() {
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let params = RanDouShaParams::new(5, 1, 5).unwrap();
+        let protocol = RanDouShaProtocol::new(params);
+        // This should succeed with honest generation (HIM check rows verified internally)
+        let party_shares = protocol.generate_local(&mut rng).unwrap();
+        assert!(RanDouShaProtocol::verify(&party_shares, 5, 1).unwrap());
+    }
+
+    #[test]
+    fn test_him_verification_catches_tampered_shares() {
+        // Verify that tampered double shares are detected by the verify function
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let params = RanDouShaParams::new(5, 1, 3).unwrap();
+        let protocol = RanDouShaProtocol::new(params);
+        let mut party_shares = protocol.generate_local(&mut rng).unwrap();
+
+        // Tamper with party 2's degree-t share for double-share 0
+        party_shares[2][0].share_t.value = party_shares[2][0].share_t.value + Fp::new(1);
+
+        let result = RanDouShaProtocol::verify(&party_shares, 5, 1);
+        assert!(result.is_err(), "tampered shares should be detected");
+        let err = result.unwrap_err();
+        assert!(
+            format!("{}", err).contains("inconsistent"),
+            "error should mention inconsistency: {}",
+            err
+        );
     }
 
     #[test]

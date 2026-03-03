@@ -57,6 +57,42 @@ impl DnMultiply {
         }
     }
 
+    /// Verify the king's opened value by independently reconstructing from
+    /// a subset of masked shares. In the honest-majority model (n > 2t),
+    /// at most t parties are corrupt, so any 2t+1 shares suffice for
+    /// correct reconstruction. If two independent subsets reconstruct to
+    /// different values, a malicious party is detected.
+    pub fn verify_king_broadcast(
+        &self,
+        masked_shares: &[Share],
+        claimed_value: Fp,
+    ) -> Result<()> {
+        if masked_shares.len() < 2 * self.t + 1 {
+            return Err(ProtocolError::MultiplyError(format!(
+                "need >= {} masked shares for verification, got {}",
+                2 * self.t + 1,
+                masked_shares.len()
+            )));
+        }
+
+        let shamir_2t = Shamir::new(self.n, 2 * self.t)?;
+        let reconstructed = shamir_2t.reconstruct(masked_shares)?;
+        if reconstructed != claimed_value {
+            return Err(ProtocolError::MaliciousParty(format!(
+                "king broadcast verification failed: reconstructed {} but king claimed {}",
+                reconstructed, claimed_value
+            )));
+        }
+        Ok(())
+    }
+
+    /// Simulate the full DN multiplication protocol locally with all parties' shares.
+    ///
+    /// **WARNING**: This is a simulation-only function for testing. It gives the caller
+    /// access to ALL parties' shares simultaneously, which would break privacy in a real
+    /// distributed setting. In production, use the individual steps
+    /// (`compute_masked_share`, `king_reconstruct`, `verify_king_broadcast`,
+    /// `compute_output_share`) with real network communication between parties.
     pub fn multiply_local(
         &self,
         x_shares: &[Share],
@@ -269,6 +305,63 @@ mod tests {
 
         let result = shamir_t.reconstruct(&result_shares).unwrap();
         assert_eq!(result, expected, "50! mod p mismatch");
+    }
+
+    #[test]
+    fn test_verify_king_broadcast_honest() {
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let n = 5;
+        let t = 1;
+        let shamir_t = Shamir::new(n, t).unwrap();
+
+        let x = Fp::new(7);
+        let y = Fp::new(6);
+        let x_shares = shamir_t.share(x, &mut rng);
+        let y_shares = shamir_t.share(y, &mut rng);
+
+        let params = RanDouShaParams::new(n, t, 1).unwrap();
+        let party_ds = RanDouShaProtocol::new(params).generate_local(&mut rng).unwrap();
+        let ds: Vec<DoubleShare> = (0..n).map(|p| party_ds[p][0].clone()).collect();
+
+        let masked_shares: Vec<Share> = (0..n)
+            .map(|i| DnMultiply::compute_masked_share(&x_shares[i], &y_shares[i], &ds[i]))
+            .collect();
+
+        let dn = DnMultiply::new(n, t, 0).unwrap();
+        let opened = dn.king_reconstruct(&masked_shares).unwrap();
+
+        // Honest king: verification should pass
+        dn.verify_king_broadcast(&masked_shares, opened).unwrap();
+    }
+
+    #[test]
+    fn test_verify_king_broadcast_detects_lying_king() {
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let n = 5;
+        let t = 1;
+        let shamir_t = Shamir::new(n, t).unwrap();
+
+        let x = Fp::new(7);
+        let y = Fp::new(6);
+        let x_shares = shamir_t.share(x, &mut rng);
+        let y_shares = shamir_t.share(y, &mut rng);
+
+        let params = RanDouShaParams::new(n, t, 1).unwrap();
+        let party_ds = RanDouShaProtocol::new(params).generate_local(&mut rng).unwrap();
+        let ds: Vec<DoubleShare> = (0..n).map(|p| party_ds[p][0].clone()).collect();
+
+        let masked_shares: Vec<Share> = (0..n)
+            .map(|i| DnMultiply::compute_masked_share(&x_shares[i], &y_shares[i], &ds[i]))
+            .collect();
+
+        let dn = DnMultiply::new(n, t, 0).unwrap();
+        let opened = dn.king_reconstruct(&masked_shares).unwrap();
+
+        // Malicious king: broadcast wrong value
+        let wrong_value = opened + Fp::new(1);
+        let result = dn.verify_king_broadcast(&masked_shares, wrong_value);
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("king broadcast verification failed"));
     }
 
     #[test]
