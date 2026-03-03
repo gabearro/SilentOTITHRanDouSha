@@ -202,7 +202,7 @@ mod tests {
         let t = 1;
         let shamir_t = Shamir::new(n, t).unwrap();
 
-        let values = vec![Fp::new(2), Fp::new(3), Fp::new(4), Fp::new(5)];
+        let values = [Fp::new(2), Fp::new(3), Fp::new(4), Fp::new(5)];
         let expected: Fp = values.iter().copied().reduce(|a, b| a * b).unwrap();
         assert_eq!(expected, Fp::new(120));
 

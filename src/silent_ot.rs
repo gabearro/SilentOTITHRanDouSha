@@ -23,15 +23,13 @@ impl Block {
     #[inline]
     pub fn xor(&self, other: &Block) -> Block {
         let mut out = [0u8; 16];
-        for i in 0..16 {
-            out[i] = self.0[i] ^ other.0[i];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = self.0[i] ^ other.0[i];
         }
         Block(out)
     }
 
     pub fn to_field_element(&self, domain: u64) -> Fp {
-        // Matyas-Meyer-Oseas: H(m) = E_m(x) XOR x
-        // XOR domain separator into the block, encrypt with fixed key, XOR back
         let domain_bytes = domain.to_le_bytes();
         let mut input = self.0;
         for i in 0..8 {
@@ -197,7 +195,6 @@ impl GgmTree {
 
         let n = self.num_leaves();
 
-        // Precompute subtree metadata
         let subtree_info: Vec<(usize, usize, &Block)> = sibling_path
             .iter()
             .enumerate()
@@ -215,7 +212,6 @@ impl GgmTree {
             })
             .collect();
 
-        // Expand subtrees in parallel
         let expanded: Vec<(usize, Vec<Block>)> = subtree_info
             .par_iter()
             .map(|&(subtree_depth, sibling_start, sibling)| {
@@ -224,7 +220,6 @@ impl GgmTree {
             })
             .collect();
 
-        // Merge results sequentially into leaves
         let mut leaves = vec![Block::ZERO; n];
         for (sibling_start, subtree_leaves) in expanded {
             for (i, leaf) in subtree_leaves.into_iter().enumerate() {
@@ -287,6 +282,7 @@ pub struct PartySetupState {
     pub my_puncture_indices: Vec<Option<usize>>,
     pub received_sibling_paths: Vec<Option<Vec<Block>>>,
     pub their_puncture_indices: Vec<Option<usize>>,
+    pub revealed_seeds: Vec<Option<Block>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -352,6 +348,7 @@ impl DistributedSilentOt {
             my_puncture_indices,
             received_sibling_paths: vec![None; n],
             their_puncture_indices: vec![None; n],
+            revealed_seeds: vec![None; n],
         }
     }
 
@@ -502,10 +499,15 @@ impl DistributedSilentOt {
         msgs
     }
 
-    pub fn process_round3(state: &PartySetupState, messages: &[DistributedMessage]) -> Result<()> {
+    pub fn process_round3(state: &mut PartySetupState, messages: &[DistributedMessage]) -> Result<()> {
         for msg in messages {
             if let DistributedMessage::SeedReveal { from, to, seed } = msg {
                 if *to == state.party_id {
+                    if state.revealed_seeds[*from].is_some() {
+                        return Err(ProtocolError::MaliciousParty(format!(
+                            "duplicate seed reveal from party {}", from
+                        )));
+                    }
                     if let Some(commitment) = state.their_commitments[*from] {
                         if !seed.verify_commitment(&commitment) {
                             return Err(ProtocolError::MaliciousParty(format!(
@@ -514,6 +516,7 @@ impl DistributedSilentOt {
                             )));
                         }
                     }
+                    state.revealed_seeds[*from] = Some(*seed);
                 }
             }
         }
@@ -543,6 +546,12 @@ impl DistributedSilentOt {
                     j
                 )));
             }
+            if state.revealed_seeds[j].is_none() {
+                return Err(ProtocolError::MaliciousParty(format!(
+                    "missing revealed seed from party {}",
+                    j
+                )));
+            }
         }
         Ok(())
     }
@@ -562,11 +571,37 @@ impl DistributedSilentOt {
             )));
         }
 
-        // Collect peer indices for parallel processing
+        let tree = GgmTree::new(tree_depth);
+        for j in 0..n {
+            if j == state.party_id {
+                continue;
+            }
+            if let (Some(revealed_seed), Some(received_path), Some(puncture_idx)) = (
+                state.revealed_seeds[j],
+                &state.received_sibling_paths[j],
+                state.my_puncture_indices[j],
+            ) {
+                let expected_path = tree.compute_sibling_path(&revealed_seed, puncture_idx)?;
+                if expected_path.len() != received_path.len() {
+                    return Err(ProtocolError::MaliciousParty(format!(
+                        "party {} sibling path length mismatch: expected {}, got {}",
+                        j, expected_path.len(), received_path.len()
+                    )));
+                }
+                for (level, (expected, received)) in expected_path.iter().zip(received_path.iter()).enumerate() {
+                    if expected != received {
+                        return Err(ProtocolError::MaliciousParty(format!(
+                            "party {} sent fake sibling path: mismatch at level {}",
+                            j, level
+                        )));
+                    }
+                }
+            }
+        }
+
         let peers: Vec<usize> = (0..n).filter(|&j| j != state.party_id).collect();
 
-        // Process all peers in parallel
-        let results: Vec<(usize, Vec<Fp>, Vec<Fp>)> = peers
+        let results: std::result::Result<Vec<(usize, Vec<Fp>, Vec<Fp>)>, ProtocolError> = peers
             .par_iter()
             .map(|&j| {
                 let tree = GgmTree::new(tree_depth);
@@ -586,7 +621,10 @@ impl DistributedSilentOt {
                 ) {
                     let leaves = tree
                         .reconstruct_from_siblings(sibling_path, puncture_idx)
-                        .expect("sibling path reconstruction failed");
+                        .map_err(|e| ProtocolError::SilentOtError(format!(
+                            "sibling path reconstruction failed for party {}: {}",
+                            j, e
+                        )))?;
                     (0..num_ots)
                         .map(|k| leaves[k].to_field_element(k as u64))
                         .collect()
@@ -594,11 +632,12 @@ impl DistributedSilentOt {
                     Vec::new()
                 };
 
-                (j, sender_vals, receiver_vals)
+                Ok((j, sender_vals, receiver_vals))
             })
             .collect();
 
-        // Reassemble into vecs indexed by party
+        let results = results?;
+
         let mut sender_values: Vec<Vec<Fp>> = vec![Vec::new(); n];
         let mut receiver_values: Vec<Vec<Fp>> = vec![Vec::new(); n];
         for (j, sv, rv) in results {
@@ -642,8 +681,7 @@ impl ExpandedCorrelations {
                 sum += self.sender_values[j][index];
             }
             if index < self.receiver_values[j].len() {
-                let is_punctured = self.puncture_indices[j]
-                    .map_or(false, |p| p == index);
+                let is_punctured = self.puncture_indices[j] == Some(index);
                 if !is_punctured {
                     sum += self.receiver_values[j][index];
                 }
@@ -752,7 +790,7 @@ mod tests {
         for state in &states {
             all_r3_msgs.extend(DistributedSilentOt::round3_seed_reveals(state));
         }
-        for state in &states {
+        for state in &mut states {
             DistributedSilentOt::process_round3(state, &all_r3_msgs).unwrap();
         }
 
@@ -854,6 +892,14 @@ mod tests {
             DistributedSilentOt::process_round2(state, &all_r2_msgs).unwrap();
         }
 
+        let mut all_r3_msgs = Vec::new();
+        for state in &states {
+            all_r3_msgs.extend(DistributedSilentOt::round3_seed_reveals(state));
+        }
+        for state in &mut states {
+            DistributedSilentOt::process_round3(state, &all_r3_msgs).unwrap();
+        }
+
         for state in &states {
             DistributedSilentOt::validate_state(state).unwrap();
         }
@@ -891,5 +937,75 @@ mod tests {
         let seed_b = Block([2u8; 16]);
         let commitment = seed_a.commit();
         assert!(!seed_b.verify_commitment(&commitment));
+    }
+
+    #[test]
+    fn test_fake_sibling_path_detected() {
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let params = SilentOtParams::new(5, 1, 16).unwrap();
+        let protocol = DistributedSilentOt::new(params);
+
+        let mut states: Vec<PartySetupState> = (0..5)
+            .map(|i| protocol.init_party(i, &mut rng))
+            .collect();
+
+        let mut all_r0_msgs = Vec::new();
+        for state in &states {
+            all_r0_msgs.extend(DistributedSilentOt::round0_commitments(state));
+        }
+        for state in &mut states {
+            DistributedSilentOt::process_round0(state, &all_r0_msgs).unwrap();
+        }
+
+        let mut all_r1_msgs = Vec::new();
+        for state in &states {
+            all_r1_msgs.extend(DistributedSilentOt::round1_puncture_choices(state));
+        }
+        for state in &mut states {
+            DistributedSilentOt::process_round1(state, &all_r1_msgs).unwrap();
+        }
+
+        let mut all_r2_msgs = Vec::new();
+        for state in &states {
+            all_r2_msgs.extend(DistributedSilentOt::round2_sibling_paths(state).unwrap());
+        }
+        for msg in &mut all_r2_msgs {
+            if let DistributedMessage::SiblingPathMsg {
+                from: 1,
+                to: 0,
+                ref mut sibling_path,
+            } = msg
+            {
+                sibling_path[0] = Block([0xff; 16]);
+            }
+        }
+        for state in &mut states {
+            DistributedSilentOt::process_round2(state, &all_r2_msgs).unwrap();
+        }
+
+        let mut all_r3_msgs = Vec::new();
+        for state in &states {
+            all_r3_msgs.extend(DistributedSilentOt::round3_seed_reveals(state));
+        }
+        for state in &mut states {
+            DistributedSilentOt::process_round3(state, &all_r3_msgs).unwrap();
+        }
+
+        let result = DistributedSilentOt::expand(&states[0]);
+        assert!(result.is_err(), "fake sibling path should be detected");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("fake sibling path"),
+            "error should mention fake sibling path: {}",
+            err_msg
+        );
+
+        for i in 1..5 {
+            assert!(
+                DistributedSilentOt::expand(&states[i]).is_ok(),
+                "party {} should expand successfully",
+                i
+            );
+        }
     }
 }

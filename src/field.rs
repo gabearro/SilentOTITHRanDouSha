@@ -69,7 +69,7 @@ impl Fp {
         let mut result = Fp::ONE;
         while exp > 0 {
             if exp & 1 == 1 {
-                result = result * base;
+                result *= base;
             }
             base = base * base;
             exp >>= 1;
@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn test_sum_trait() {
-        let vals = vec![Fp::new(1), Fp::new(2), Fp::new(3)];
+        let vals = [Fp::new(1), Fp::new(2), Fp::new(3)];
         let total: Fp = vals.iter().sum();
         assert_eq!(total, Fp::new(6));
     }

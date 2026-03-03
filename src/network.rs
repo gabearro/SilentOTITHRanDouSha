@@ -26,7 +26,7 @@ impl PartyNetwork {
 
     pub async fn broadcast<T: Serialize>(&self, msg: &T) -> Result<(), String> {
         let data = bincode::serialize(msg).map_err(|e| e.to_string())?;
-        for (_, sender) in &self.senders {
+        for sender in self.senders.values() {
             sender
                 .send((self.party_id, data.clone()))
                 .await

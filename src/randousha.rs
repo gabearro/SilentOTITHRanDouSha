@@ -93,7 +93,7 @@ impl RanDouShaProtocol {
 
         let r0_msgs: Vec<_> = ot_states
             .iter()
-            .flat_map(|s| DistributedSilentOt::round0_commitments(s))
+            .flat_map(DistributedSilentOt::round0_commitments)
             .collect();
         for s in &mut ot_states {
             DistributedSilentOt::process_round0(s, &r0_msgs)?;
@@ -101,7 +101,7 @@ impl RanDouShaProtocol {
 
         let r1_msgs: Vec<_> = ot_states
             .iter()
-            .flat_map(|s| DistributedSilentOt::round1_puncture_choices(s))
+            .flat_map(DistributedSilentOt::round1_puncture_choices)
             .collect();
         for s in &mut ot_states {
             DistributedSilentOt::process_round1(s, &r1_msgs)?;
@@ -117,20 +117,20 @@ impl RanDouShaProtocol {
 
         let r3_msgs: Vec<_> = ot_states
             .iter()
-            .flat_map(|s| DistributedSilentOt::round3_seed_reveals(s))
+            .flat_map(DistributedSilentOt::round3_seed_reveals)
             .collect();
-        for s in &ot_states {
+        for s in &mut ot_states {
             DistributedSilentOt::process_round3(s, &r3_msgs)?;
         }
 
         let ot_correlations: Vec<ExpandedCorrelations> = ot_states
             .iter()
-            .map(|s| DistributedSilentOt::expand(s))
+            .map(DistributedSilentOt::expand)
             .collect::<Result<_>>()?;
 
         let him = HyperInvertibleMatrix::new(n);
         let sharings_per_round = n - 2 * t;
-        let num_rounds = (count + sharings_per_round - 1) / sharings_per_round;
+        let num_rounds = count.div_ceil(sharings_per_round);
 
         let mut all_party_shares: Vec<Vec<DoubleShare>> = vec![Vec::new(); n];
 
@@ -357,7 +357,7 @@ mod tests {
         let protocol = RanDouShaProtocol::new(params);
         let mut party_shares = protocol.generate_local(&mut rng).unwrap();
 
-        party_shares[2][0].share_t.value = party_shares[2][0].share_t.value + Fp::new(1);
+        party_shares[2][0].share_t.value += Fp::new(1);
 
         let result = RanDouShaProtocol::verify(&party_shares, 5, 1);
         assert!(result.is_err(), "tampered shares should be detected");
@@ -382,11 +382,11 @@ mod tests {
         use crate::silent_ot::{DistributedSilentOt, SilentOtParams};
 
         let mut rng = ChaCha20Rng::seed_from_u64(42);
-        let count = 2_000_000;
-        let n = 5;
-        let t = 1;
+        let count: usize = 2_000_000;
+        let n: usize = 5;
+        let t: usize = 1;
         let sharings_per_round = n - 2 * t;
-        let num_rounds = (count + sharings_per_round - 1) / sharings_per_round;
+        let num_rounds = count.div_ceil(sharings_per_round);
 
         eprintln!(
             "generating {} double shares (n={}, t={}, {} HIM rounds)",
@@ -401,7 +401,7 @@ mod tests {
 
         let r0_msgs: Vec<_> = ot_states
             .iter()
-            .flat_map(|s| DistributedSilentOt::round0_commitments(s))
+            .flat_map(DistributedSilentOt::round0_commitments)
             .collect();
         for s in &mut ot_states {
             DistributedSilentOt::process_round0(s, &r0_msgs).unwrap();
@@ -409,7 +409,7 @@ mod tests {
 
         let r1_msgs: Vec<_> = ot_states
             .iter()
-            .flat_map(|s| DistributedSilentOt::round1_puncture_choices(s))
+            .flat_map(DistributedSilentOt::round1_puncture_choices)
             .collect();
         for s in &mut ot_states {
             DistributedSilentOt::process_round1(s, &r1_msgs).unwrap();
@@ -425,9 +425,9 @@ mod tests {
 
         let r3_msgs: Vec<_> = ot_states
             .iter()
-            .flat_map(|s| DistributedSilentOt::round3_seed_reveals(s))
+            .flat_map(DistributedSilentOt::round3_seed_reveals)
             .collect();
-        for s in &ot_states {
+        for s in &mut ot_states {
             DistributedSilentOt::process_round3(s, &r3_msgs).unwrap();
         }
 
@@ -517,19 +517,18 @@ mod tests {
         use crate::silent_ot::{DistributedSilentOt, SilentOtParams};
 
         let mut rng = ChaCha20Rng::seed_from_u64(12345);
-        let n = 5;
-        let t = 1;
-        let num_mults = 2_000_000;
+        let n: usize = 5;
+        let t: usize = 1;
+        let num_mults: usize = 2_000_000;
         let num_values = num_mults + 1;
         let sharings_per_round = n - 2 * t;
-        let num_rounds = (num_mults + sharings_per_round - 1) / sharings_per_round;
+        let num_rounds = num_mults.div_ceil(sharings_per_round);
 
         eprintln!(
             "=== 2M chain multiply: {} multiplications (n={}, t={}, {} HIM rounds) ===",
             num_mults, n, t, num_rounds
         );
 
-        // --- Silent OT setup ---
         let ot_start = std::time::Instant::now();
         let ot_params = SilentOtParams::new(n, t, num_rounds).unwrap();
         let ot_protocol = DistributedSilentOt::new(ot_params);
@@ -538,7 +537,7 @@ mod tests {
 
         let r0_msgs: Vec<_> = ot_states
             .iter()
-            .flat_map(|s| DistributedSilentOt::round0_commitments(s))
+            .flat_map(DistributedSilentOt::round0_commitments)
             .collect();
         for s in &mut ot_states {
             DistributedSilentOt::process_round0(s, &r0_msgs).unwrap();
@@ -546,7 +545,7 @@ mod tests {
 
         let r1_msgs: Vec<_> = ot_states
             .iter()
-            .flat_map(|s| DistributedSilentOt::round1_puncture_choices(s))
+            .flat_map(DistributedSilentOt::round1_puncture_choices)
             .collect();
         for s in &mut ot_states {
             DistributedSilentOt::process_round1(s, &r1_msgs).unwrap();
@@ -562,9 +561,9 @@ mod tests {
 
         let r3_msgs: Vec<_> = ot_states
             .iter()
-            .flat_map(|s| DistributedSilentOt::round3_seed_reveals(s))
+            .flat_map(DistributedSilentOt::round3_seed_reveals)
             .collect();
-        for s in &ot_states {
+        for s in &mut ot_states {
             DistributedSilentOt::process_round3(s, &r3_msgs).unwrap();
         }
 
@@ -575,7 +574,6 @@ mod tests {
         let ot_elapsed = ot_start.elapsed();
         eprintln!("silent OT setup + expand: {:.2?}", ot_elapsed);
 
-        // --- HIM: generate double shares from OT correlations ---
         let him_start = std::time::Instant::now();
         let shamir_t = Shamir::new(n, t).unwrap();
         let shamir_2t = Shamir::new(n, 2 * t).unwrap();
@@ -638,7 +636,6 @@ mod tests {
             ot_elapsed + him_elapsed
         );
 
-        // --- Verify a sample of double shares ---
         let verify_start = std::time::Instant::now();
         let sample_size = 1000;
         let sample_shares: Vec<Vec<DoubleShare>> = (0..n)
@@ -651,8 +648,6 @@ mod tests {
             verify_start.elapsed()
         );
 
-        // --- Online phase: chain multiply 2M+1 values ---
-        // Cyclic values 2..=8 to keep things predictable
         let values: Vec<Fp> = (0..num_values)
             .map(|i| Fp::new((i % 7 + 2) as u64))
             .collect();
@@ -666,7 +661,6 @@ mod tests {
             .map(|v| shamir_t.share(*v, &mut rng))
             .collect();
 
-        // Reshape: double_shares[k][p] for multiplication k, party p
         let double_shares: Vec<Vec<DoubleShare>> = (0..num_mults)
             .map(|k| (0..n).map(|p| all_party_shares[p][k].clone()).collect())
             .collect();
@@ -681,7 +675,6 @@ mod tests {
             num_mults, online_elapsed
         );
 
-        // Reveal
         let result = shamir_t.reconstruct(&result_shares).unwrap();
         assert_eq!(
             result, expected,

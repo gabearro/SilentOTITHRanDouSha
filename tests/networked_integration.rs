@@ -1,7 +1,11 @@
+#![allow(clippy::needless_range_loop)]
+
 use silent_ot_randousha::field::Fp;
 use silent_ot_randousha::multiply::DnMultiply;
 use silent_ot_randousha::network::{setup_tcp_network, PartyNetwork};
-use silent_ot_randousha::randousha::{DoubleShare, RanDouShaParams, RanDouShaProtocol};
+use silent_ot_randousha::randousha::{
+    DoubleShare, HyperInvertibleMatrix, RanDouShaParams, RanDouShaProtocol,
+};
 use silent_ot_randousha::shamir::{Shamir, Share};
 use silent_ot_randousha::silent_ot::{
     Block, DistributedMessage, DistributedSilentOt, SilentOtParams,
@@ -115,7 +119,16 @@ async fn run_silent_ot_setup(
     party_id: usize,
     rng: &mut ChaCha20Rng,
 ) -> Vec<Fp> {
-    let ot_params = SilentOtParams::new(N, T, 128).unwrap();
+    run_silent_ot_setup_n(net, party_id, rng, 128).await
+}
+
+async fn run_silent_ot_setup_n(
+    net: &mut BufferedNet,
+    party_id: usize,
+    rng: &mut ChaCha20Rng,
+    num_randoms: usize,
+) -> Vec<Fp> {
+    let ot_params = SilentOtParams::new(N, T, std::cmp::max(num_randoms, 16)).unwrap();
     let protocol = DistributedSilentOt::new(ot_params);
     let mut ot_state = protocol.init_party(party_id, rng);
 
@@ -191,11 +204,10 @@ async fn run_silent_ot_setup(
             seed,
         })
         .collect();
-    DistributedSilentOt::process_round3(&ot_state, &dist_r3).unwrap();
+    DistributedSilentOt::process_round3(&mut ot_state, &dist_r3).unwrap();
 
     let correlations = DistributedSilentOt::expand(&ot_state).unwrap();
 
-    let num_randoms = 128;
     (0..num_randoms)
         .map(|k| correlations.get_random(k))
         .collect()
@@ -234,9 +246,9 @@ async fn run_party(net: PartyNetwork, party_id: usize) -> Option<Fp> {
 
         let mut val_t = my_contribs[k].0[party_id];
         let mut val_2t = my_contribs[k].1[party_id];
-        for (_, (st, s2t)) in &received {
-            val_t.value = val_t.value + st.value;
-            val_2t.value = val_2t.value + s2t.value;
+        for (st, s2t) in received.values() {
+            val_t.value += st.value;
+            val_2t.value += s2t.value;
         }
         my_double_shares.push(DoubleShare {
             share_t: val_t,
@@ -244,7 +256,7 @@ async fn run_party(net: PartyNetwork, party_id: usize) -> Option<Fp> {
         });
     }
 
-    let values = vec![Fp::new(3), Fp::new(5), Fp::new(7), Fp::new(11)];
+    let values = [Fp::new(3), Fp::new(5), Fp::new(7), Fp::new(11)];
     let num_values = values.len();
     let mut my_input_shares: Vec<Share> = Vec::with_capacity(num_values);
 
@@ -372,9 +384,9 @@ async fn test_networked_randousha_verification() {
                     bnet.recv_from_all(1, k as u32).await.unwrap();
                 let mut val_t = my_contribs[k].0[i];
                 let mut val_2t = my_contribs[k].1[i];
-                for (_, (st, s2t)) in &received {
-                    val_t.value = val_t.value + st.value;
-                    val_2t.value = val_2t.value + s2t.value;
+                for (st, s2t) in received.values() {
+                    val_t.value += st.value;
+                    val_2t.value += s2t.value;
                 }
                 double_shares.push(DoubleShare {
                     share_t: val_t,
@@ -484,9 +496,9 @@ async fn test_networked_mass_chained_multiplication() {
                     bnet.recv_from_all(1, k as u32).await.unwrap();
                 let mut val_t = my_contribs[k].0[party_id];
                 let mut val_2t = my_contribs[k].1[party_id];
-                for (_, (st, s2t)) in &received {
-                    val_t.value = val_t.value + st.value;
-                    val_2t.value = val_2t.value + s2t.value;
+                for (st, s2t) in received.values() {
+                    val_t.value += st.value;
+                    val_2t.value += s2t.value;
                 }
                 double_shares.push(DoubleShare {
                     share_t: val_t,
@@ -581,45 +593,104 @@ async fn run_offline_online_multiply(
     net: PartyNetwork,
     party_id: usize,
     values: Vec<Fp>,
-    ot_count: usize,
+    _ot_count: usize,
 ) -> Option<Fp> {
     let mut rng = ChaCha20Rng::seed_from_u64(party_id as u64 + 7000);
     let mut bnet = BufferedNet::new(net);
     let shamir_t = Shamir::new(N, T).unwrap();
     let shamir_2t = Shamir::new(N, 2 * T).unwrap();
     let num_mults = values.len() - 1;
+    let sharings_per_round = N - 2 * T;
+    let num_him_rounds = num_mults.div_ceil(sharings_per_round);
+    let him = HyperInvertibleMatrix::new(N);
 
-    let ot_randoms = run_silent_ot_setup(&mut bnet, party_id, &mut rng).await;
+    let ot_randoms =
+        run_silent_ot_setup_n(&mut bnet, party_id, &mut rng, num_him_rounds).await;
 
-    let mut my_contribs: Vec<(Vec<Share>, Vec<Share>)> = Vec::new();
-    for k in 0..num_mults {
-        let secret = ot_randoms[k % ot_count];
+    let mut double_shares: Vec<DoubleShare> = Vec::with_capacity(num_mults);
+
+    for him_round in 0..num_him_rounds {
+        let secret = ot_randoms[him_round];
         let st = shamir_t.share(secret, &mut rng);
         let s2t = shamir_2t.share(secret, &mut rng);
+
         for j in 0..N {
             if j == party_id {
                 continue;
             }
             let msg: (Share, Share) = (st[j], s2t[j]);
-            bnet.send(j, 1, k as u32, &msg).await.unwrap();
+            bnet.send(j, 1, him_round as u32, &msg).await.unwrap();
         }
-        my_contribs.push((st, s2t));
-    }
 
-    let mut double_shares: Vec<DoubleShare> = Vec::with_capacity(num_mults);
-    for k in 0..num_mults {
         let received: HashMap<usize, (Share, Share)> =
-            bnet.recv_from_all(1, k as u32).await.unwrap();
-        let mut val_t = my_contribs[k].0[party_id];
-        let mut val_2t = my_contribs[k].1[party_id];
-        for (_, (st, s2t)) in &received {
-            val_t.value = val_t.value + st.value;
-            val_2t.value = val_2t.value + s2t.value;
+            bnet.recv_from_all(1, him_round as u32).await.unwrap();
+
+        let mut input_t = vec![Fp::ZERO; N];
+        let mut input_2t = vec![Fp::ZERO; N];
+        input_t[party_id] = st[party_id].value;
+        input_2t[party_id] = s2t[party_id].value;
+        for (&from, (s, s2)) in &received {
+            input_t[from] = s.value;
+            input_2t[from] = s2.value;
         }
-        double_shares.push(DoubleShare {
-            share_t: val_t,
-            share_2t: val_2t,
-        });
+
+        let out_t = him.mul_vec(&input_t);
+        let out_2t = him.mul_vec(&input_2t);
+
+        for check_idx in sharings_per_round..N {
+            let my_check_t = out_t[check_idx];
+            let my_check_2t = out_2t[check_idx];
+            let check_msg: (Fp, Fp) = (my_check_t, my_check_2t);
+            bnet.broadcast(10, (him_round * N + check_idx) as u32, &check_msg)
+                .await
+                .unwrap();
+            let check_received: HashMap<usize, (Fp, Fp)> = bnet
+                .recv_from_all(10, (him_round * N + check_idx) as u32)
+                .await
+                .unwrap();
+
+            let mut check_shares_t = vec![Share {
+                point: shamir_t.eval_points[party_id],
+                value: my_check_t,
+            }];
+            let mut check_shares_2t = vec![Share {
+                point: shamir_2t.eval_points[party_id],
+                value: my_check_2t,
+            }];
+            for (&from, &(ct, c2t)) in &check_received {
+                check_shares_t.push(Share {
+                    point: shamir_t.eval_points[from],
+                    value: ct,
+                });
+                check_shares_2t.push(Share {
+                    point: shamir_2t.eval_points[from],
+                    value: c2t,
+                });
+            }
+            let secret_t = shamir_t.reconstruct(&check_shares_t).unwrap();
+            let secret_2t = shamir_2t.reconstruct(&check_shares_2t).unwrap();
+            assert_eq!(
+                secret_t, secret_2t,
+                "HIM check row {} failed in round {}: t={} vs 2t={}",
+                check_idx, him_round, secret_t, secret_2t
+            );
+        }
+
+        for j in 0..sharings_per_round {
+            if double_shares.len() >= num_mults {
+                break;
+            }
+            double_shares.push(DoubleShare {
+                share_t: Share {
+                    point: shamir_t.eval_points[party_id],
+                    value: out_t[j],
+                },
+                share_2t: Share {
+                    point: shamir_2t.eval_points[party_id],
+                    value: out_2t[j],
+                },
+            });
+        }
     }
 
     let num_values = values.len();
@@ -639,6 +710,7 @@ async fn run_offline_online_multiply(
         }
     }
 
+    let dn = DnMultiply::new(N, T, KING).unwrap();
     let mut current = my_input_shares[0];
     for mult_idx in 0..num_mults {
         let next = my_input_shares[mult_idx + 1];
@@ -646,7 +718,7 @@ async fn run_offline_online_multiply(
         let masked = DnMultiply::compute_masked_share(&current, &next, ds);
 
         let phase = 3;
-        let round = (mult_idx * 2) as u32;
+        let round = (mult_idx * 3) as u32;
 
         if party_id != KING {
             bnet.send(KING, phase, round, &masked).await.unwrap();
@@ -660,13 +732,21 @@ async fn run_offline_online_multiply(
             for (_, s) in received {
                 all_masked.push(s);
             }
-            let dn = DnMultiply::new(N, T, KING).unwrap();
             opened = dn.king_reconstruct(&all_masked).unwrap();
             bnet.broadcast(phase, round + 1, &opened).await.unwrap();
         } else {
             let (_, val): (usize, Fp) = bnet.recv(phase, round + 1).await.unwrap();
             opened = val;
         }
+
+        bnet.broadcast(phase, round + 2, &masked).await.unwrap();
+        let verify_received: HashMap<usize, Share> =
+            bnet.recv_from_all(phase, round + 2).await.unwrap();
+        let mut verify_shares = vec![masked];
+        for (_, s) in verify_received {
+            verify_shares.push(s);
+        }
+        dn.verify_king_broadcast(&verify_shares, opened).unwrap();
 
         current = DnMultiply::compute_output_share(opened, ds);
     }
@@ -797,7 +877,7 @@ async fn test_malicious_double_share_detection() {
     eprintln!("  Tampered degree-t share: DETECTED");
 
     party_shares[1][0].share_t.value = original;
-    party_shares[1][0].share_2t.value = party_shares[1][0].share_2t.value + Fp::new(42);
+    party_shares[1][0].share_2t.value += Fp::new(42);
 
     let result = RanDouShaProtocol::verify(&party_shares, n, t);
     assert!(result.is_err(), "tampered 2t shares must be detected");
@@ -920,9 +1000,9 @@ async fn test_chained_multiply_with_intermediate_reveals() {
                     bnet.recv_from_all(1, k as u32).await.unwrap();
                 let mut val_t = my_contribs[k].0[party_id];
                 let mut val_2t = my_contribs[k].1[party_id];
-                for (_, (st, s2t)) in &received {
-                    val_t.value = val_t.value + st.value;
-                    val_2t.value = val_2t.value + s2t.value;
+                for (st, s2t) in received.values() {
+                    val_t.value += st.value;
+                    val_2t.value += s2t.value;
                 }
                 double_shares.push(DoubleShare {
                     share_t: val_t,
@@ -1011,11 +1091,11 @@ async fn test_chained_multiply_with_intermediate_reveals() {
     }
 
     let intermediates = party_results[0].as_ref().unwrap();
-    let expected_intermediates = vec![
-        Fp::new(2 * 3),                    // 6
-        Fp::new(2 * 3 * 5),                // 30
-        Fp::new(2 * 3 * 5 * 7),            // 210
-        Fp::new(2 * 3 * 5 * 7 * 11),       // 2310
+    let expected_intermediates = [
+        Fp::new(6),
+        Fp::new(30),
+        Fp::new(210),
+        Fp::new(2310),
     ];
 
     for (i, (got, exp)) in intermediates.iter().zip(expected_intermediates.iter()).enumerate() {
@@ -1027,4 +1107,112 @@ async fn test_chained_multiply_with_intermediate_reveals() {
         eprintln!("  Step {}: product = {} (expected {})", i + 1, got, exp);
     }
     eprintln!("=== PASSED: all intermediate reveals correct ===");
+}
+
+#[tokio::test]
+async fn test_mass_chained_offline_multiply_200() {
+    let num_values = 200;
+    let values: Vec<Fp> = (0..num_values).map(|i| Fp::new((i % 7 + 2) as u64)).collect();
+    let expected: Fp = values.iter().copied().reduce(|a, b| a * b).unwrap();
+
+    eprintln!("=== Mass offline multiply+reveal: {} values ===", num_values);
+
+    let networks = setup_tcp_network(N, 18000).await;
+    let mut handles = Vec::new();
+    for (party_id, net) in networks.into_iter().enumerate() {
+        let vals = values.clone();
+        handles.push(tokio::spawn(
+            run_offline_online_multiply(net, party_id, vals, 0),
+        ));
+    }
+
+    let mut results = Vec::new();
+    for handle in handles {
+        results.push(handle.await.unwrap());
+    }
+
+    let result = results[0].expect("Party 0 should produce result");
+    assert_eq!(result, expected, "200-value multiply: {} != {}", result, expected);
+    eprintln!("=== PASSED: 200-value chained offline multiply+reveal ===");
+}
+
+#[tokio::test]
+async fn test_mass_chained_offline_multiply_500() {
+    let num_values = 500;
+    let values: Vec<Fp> = (0..num_values).map(|i| Fp::new((i % 11 + 2) as u64)).collect();
+    let expected: Fp = values.iter().copied().reduce(|a, b| a * b).unwrap();
+
+    eprintln!("=== Mass offline multiply+reveal: {} values ===", num_values);
+
+    let networks = setup_tcp_network(N, 18100).await;
+    let mut handles = Vec::new();
+    for (party_id, net) in networks.into_iter().enumerate() {
+        let vals = values.clone();
+        handles.push(tokio::spawn(
+            run_offline_online_multiply(net, party_id, vals, 0),
+        ));
+    }
+
+    let mut results = Vec::new();
+    for handle in handles {
+        results.push(handle.await.unwrap());
+    }
+
+    let result = results[0].expect("Party 0 should produce result");
+    assert_eq!(result, expected, "500-value multiply: {} != {}", result, expected);
+    eprintln!("=== PASSED: 500-value chained offline multiply+reveal ===");
+}
+
+#[tokio::test]
+async fn test_mass_chained_offline_multiply_1000() {
+    let num_values = 1000;
+    let values: Vec<Fp> = (0..num_values).map(|i| Fp::new((i % 13 + 2) as u64)).collect();
+    let expected: Fp = values.iter().copied().reduce(|a, b| a * b).unwrap();
+
+    eprintln!("=== Mass offline multiply+reveal: {} values ===", num_values);
+
+    let networks = setup_tcp_network(N, 18200).await;
+    let mut handles = Vec::new();
+    for (party_id, net) in networks.into_iter().enumerate() {
+        let vals = values.clone();
+        handles.push(tokio::spawn(
+            run_offline_online_multiply(net, party_id, vals, 0),
+        ));
+    }
+
+    let mut results = Vec::new();
+    for handle in handles {
+        results.push(handle.await.unwrap());
+    }
+
+    let result = results[0].expect("Party 0 should produce result");
+    assert_eq!(result, expected, "1000-value multiply: {} != {}", result, expected);
+    eprintln!("=== PASSED: 1000-value chained offline multiply+reveal ===");
+}
+
+#[tokio::test]
+async fn test_him_check_row_verification_networked() {
+    eprintln!("=== Testing HIM check row verification over network ===");
+
+    let num_values = 10;
+    let values: Vec<Fp> = (1..=num_values as u64).map(Fp::new).collect();
+    let expected: Fp = values.iter().copied().reduce(|a, b| a * b).unwrap();
+
+    let networks = setup_tcp_network(N, 18300).await;
+    let mut handles = Vec::new();
+    for (party_id, net) in networks.into_iter().enumerate() {
+        let vals = values.clone();
+        handles.push(tokio::spawn(
+            run_offline_online_multiply(net, party_id, vals, 0),
+        ));
+    }
+
+    let mut results = Vec::new();
+    for handle in handles {
+        results.push(handle.await.unwrap());
+    }
+
+    let result = results[0].expect("Party 0 should produce result");
+    assert_eq!(result, expected, "10!: {} != {}", result, expected);
+    eprintln!("=== PASSED: HIM check row verification over network, 10! = {} ===", result);
 }

@@ -121,6 +121,18 @@ pub fn lagrange_interpolate_at_zero(shares: &[Share]) -> Result<Fp> {
 
 pub fn lagrange_interpolate_at(shares: &[Share], target: Fp) -> Result<Fp> {
     let n = shares.len();
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if shares[i].point == shares[j].point {
+                return Err(ProtocolError::MaliciousParty(format!(
+                    "duplicate evaluation point {} at indices {} and {}",
+                    shares[i].point, i, j
+                )));
+            }
+        }
+    }
+
     let mut result = Fp::ZERO;
 
     for i in 0..n {
