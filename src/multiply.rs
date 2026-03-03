@@ -130,6 +130,22 @@ pub fn multiply_sequence(
             double_shares.len()
         )));
     }
+    for (idx, vs) in value_shares.iter().enumerate() {
+        if vs.len() != n {
+            return Err(ProtocolError::InvalidParams(format!(
+                "value_shares[{}] has {} shares, expected {}",
+                idx, vs.len(), n
+            )));
+        }
+    }
+    for (idx, ds) in double_shares.iter().enumerate() {
+        if ds.len() != n {
+            return Err(ProtocolError::InvalidParams(format!(
+                "double_shares[{}] has {} shares, expected {}",
+                idx, ds.len(), n
+            )));
+        }
+    }
 
     let shamir_2t = Shamir::new(n, 2 * t)?;
     let lagrange = shamir_2t.lagrange_coefficients();

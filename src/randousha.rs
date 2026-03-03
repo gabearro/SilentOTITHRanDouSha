@@ -93,41 +93,50 @@ impl RanDouShaProtocol {
 
         let mut ot_states: Vec<_> = (0..n).map(|i| protocol.init_party(i, rng)).collect();
 
-        let r0_msgs: Vec<_> = ot_states
-            .iter()
-            .flat_map(DistributedSilentOt::round0_commitments)
-            .collect();
-        for s in &mut ot_states {
-            DistributedSilentOt::process_round0(s, &r0_msgs)?;
+        // Pre-bucket messages by recipient for O(n²) dispatch instead of O(n³) scanning
+        let mut r0 = vec![Vec::new(); n];
+        for s in ot_states.iter() {
+            for (to, c) in DistributedSilentOt::round0_commitments(s) {
+                r0[to].push((s.party_id, c));
+            }
+        }
+        for (i, s) in ot_states.iter_mut().enumerate() {
+            DistributedSilentOt::process_round0(s, &r0[i])?;
         }
 
-        let r1_msgs: Vec<_> = ot_states
-            .iter()
-            .flat_map(DistributedSilentOt::round1_puncture_choices)
-            .collect();
-        for s in &mut ot_states {
-            DistributedSilentOt::process_round1(s, &r1_msgs)?;
+        let mut r1 = vec![Vec::new(); n];
+        for s in ot_states.iter() {
+            for (to, idx) in DistributedSilentOt::round1_puncture_choices(s) {
+                r1[to].push((s.party_id, idx));
+            }
+        }
+        for (i, s) in ot_states.iter_mut().enumerate() {
+            DistributedSilentOt::process_round1(s, &r1[i])?;
         }
 
-        let mut r2_msgs = Vec::new();
-        for s in &ot_states {
-            r2_msgs.extend(DistributedSilentOt::round2_sibling_paths(s)?);
+        let mut r2 = vec![Vec::new(); n];
+        for s in ot_states.iter() {
+            for (to, path) in DistributedSilentOt::round2_sibling_paths(s)? {
+                r2[to].push((s.party_id, path));
+            }
         }
-        for s in &mut ot_states {
-            DistributedSilentOt::process_round2(s, &r2_msgs)?;
+        for (i, s) in ot_states.iter_mut().enumerate() {
+            DistributedSilentOt::process_round2(s, &r2[i])?;
         }
 
-        let r3_msgs: Vec<_> = ot_states
-            .iter()
-            .flat_map(DistributedSilentOt::round3_seed_reveals)
-            .collect();
-        for s in &mut ot_states {
-            DistributedSilentOt::process_round3(s, &r3_msgs)?;
+        let mut r3 = vec![Vec::new(); n];
+        for s in ot_states.iter() {
+            for (to, seed) in DistributedSilentOt::round3_seed_reveals(s) {
+                r3[to].push((s.party_id, seed));
+            }
+        }
+        for (i, s) in ot_states.iter_mut().enumerate() {
+            DistributedSilentOt::process_round3(s, &r3[i])?;
         }
 
         let ot_correlations: Vec<ExpandedCorrelations> = ot_states
             .par_iter()
-            .map(|s| DistributedSilentOt::expand(s))
+            .map(DistributedSilentOt::expand)
             .collect::<Result<_>>()?;
 
         let him = HyperInvertibleMatrix::new(n);
@@ -366,6 +375,36 @@ mod tests {
     }
 
     #[test]
+    fn test_randousha_minimum_params_n3_t1() {
+        // n=3, t=1 is the minimum valid configuration (n > 2t → 3 > 2)
+        // sharings_per_round = n - 2t = 1, check_rows = 2
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let params = RanDouShaParams::new(3, 1, 5).unwrap();
+        let protocol = RanDouShaProtocol::new(params);
+        let party_shares = protocol.generate_local(&mut rng).unwrap();
+
+        assert_eq!(party_shares.len(), 3);
+        for shares in &party_shares {
+            assert_eq!(shares.len(), 5);
+        }
+        assert!(RanDouShaProtocol::verify(&party_shares, 3, 1).unwrap());
+
+        // Verify double shares work for multiplication
+        let shamir_t = Shamir::new(3, 1).unwrap();
+        let x = Fp::new(7);
+        let y = Fp::new(6);
+        let x_shares = shamir_t.share(x, &mut rng);
+        let y_shares = shamir_t.share(y, &mut rng);
+        let ds: Vec<DoubleShare> = (0..3).map(|p| party_shares[p][0].clone()).collect();
+
+        use crate::multiply::DnMultiply;
+        let dn = DnMultiply::new(3, 1, 0).unwrap();
+        let result_shares = dn.multiply_local(&x_shares, &y_shares, &ds).unwrap();
+        let result = shamir_t.reconstruct(&result_shares).unwrap();
+        assert_eq!(result, x * y);
+    }
+
+    #[test]
     #[ignore]
     fn test_randousha_2m_silent_ot() {
         use crate::silent_ot::{DistributedSilentOt, SilentOtParams};
@@ -388,36 +427,44 @@ mod tests {
         let mut ot_states: Vec<_> =
             (0..n).map(|i| ot_protocol.init_party(i, &mut rng)).collect();
 
-        let r0_msgs: Vec<_> = ot_states
-            .iter()
-            .flat_map(DistributedSilentOt::round0_commitments)
-            .collect();
-        for s in &mut ot_states {
-            DistributedSilentOt::process_round0(s, &r0_msgs).unwrap();
+        let mut r0 = vec![Vec::new(); n];
+        for s in ot_states.iter() {
+            for (to, c) in DistributedSilentOt::round0_commitments(s) {
+                r0[to].push((s.party_id, c));
+            }
+        }
+        for (i, s) in ot_states.iter_mut().enumerate() {
+            DistributedSilentOt::process_round0(s, &r0[i]).unwrap();
         }
 
-        let r1_msgs: Vec<_> = ot_states
-            .iter()
-            .flat_map(DistributedSilentOt::round1_puncture_choices)
-            .collect();
-        for s in &mut ot_states {
-            DistributedSilentOt::process_round1(s, &r1_msgs).unwrap();
+        let mut r1 = vec![Vec::new(); n];
+        for s in ot_states.iter() {
+            for (to, idx) in DistributedSilentOt::round1_puncture_choices(s) {
+                r1[to].push((s.party_id, idx));
+            }
+        }
+        for (i, s) in ot_states.iter_mut().enumerate() {
+            DistributedSilentOt::process_round1(s, &r1[i]).unwrap();
         }
 
-        let mut r2_msgs = Vec::new();
-        for s in &ot_states {
-            r2_msgs.extend(DistributedSilentOt::round2_sibling_paths(s).unwrap());
+        let mut r2 = vec![Vec::new(); n];
+        for s in ot_states.iter() {
+            for (to, path) in DistributedSilentOt::round2_sibling_paths(s).unwrap() {
+                r2[to].push((s.party_id, path));
+            }
         }
-        for s in &mut ot_states {
-            DistributedSilentOt::process_round2(s, &r2_msgs).unwrap();
+        for (i, s) in ot_states.iter_mut().enumerate() {
+            DistributedSilentOt::process_round2(s, &r2[i]).unwrap();
         }
 
-        let r3_msgs: Vec<_> = ot_states
-            .iter()
-            .flat_map(DistributedSilentOt::round3_seed_reveals)
-            .collect();
-        for s in &mut ot_states {
-            DistributedSilentOt::process_round3(s, &r3_msgs).unwrap();
+        let mut r3 = vec![Vec::new(); n];
+        for s in ot_states.iter() {
+            for (to, seed) in DistributedSilentOt::round3_seed_reveals(s) {
+                r3[to].push((s.party_id, seed));
+            }
+        }
+        for (i, s) in ot_states.iter_mut().enumerate() {
+            DistributedSilentOt::process_round3(s, &r3[i]).unwrap();
         }
 
         let ot_correlations: Vec<_> = ot_states
@@ -525,36 +572,44 @@ mod tests {
         let mut ot_states: Vec<_> =
             (0..n).map(|i| ot_protocol.init_party(i, &mut rng)).collect();
 
-        let r0_msgs: Vec<_> = ot_states
-            .iter()
-            .flat_map(DistributedSilentOt::round0_commitments)
-            .collect();
-        for s in &mut ot_states {
-            DistributedSilentOt::process_round0(s, &r0_msgs).unwrap();
+        let mut r0 = vec![Vec::new(); n];
+        for s in ot_states.iter() {
+            for (to, c) in DistributedSilentOt::round0_commitments(s) {
+                r0[to].push((s.party_id, c));
+            }
+        }
+        for (i, s) in ot_states.iter_mut().enumerate() {
+            DistributedSilentOt::process_round0(s, &r0[i]).unwrap();
         }
 
-        let r1_msgs: Vec<_> = ot_states
-            .iter()
-            .flat_map(DistributedSilentOt::round1_puncture_choices)
-            .collect();
-        for s in &mut ot_states {
-            DistributedSilentOt::process_round1(s, &r1_msgs).unwrap();
+        let mut r1 = vec![Vec::new(); n];
+        for s in ot_states.iter() {
+            for (to, idx) in DistributedSilentOt::round1_puncture_choices(s) {
+                r1[to].push((s.party_id, idx));
+            }
+        }
+        for (i, s) in ot_states.iter_mut().enumerate() {
+            DistributedSilentOt::process_round1(s, &r1[i]).unwrap();
         }
 
-        let mut r2_msgs = Vec::new();
-        for s in &ot_states {
-            r2_msgs.extend(DistributedSilentOt::round2_sibling_paths(s).unwrap());
+        let mut r2 = vec![Vec::new(); n];
+        for s in ot_states.iter() {
+            for (to, path) in DistributedSilentOt::round2_sibling_paths(s).unwrap() {
+                r2[to].push((s.party_id, path));
+            }
         }
-        for s in &mut ot_states {
-            DistributedSilentOt::process_round2(s, &r2_msgs).unwrap();
+        for (i, s) in ot_states.iter_mut().enumerate() {
+            DistributedSilentOt::process_round2(s, &r2[i]).unwrap();
         }
 
-        let r3_msgs: Vec<_> = ot_states
-            .iter()
-            .flat_map(DistributedSilentOt::round3_seed_reveals)
-            .collect();
-        for s in &mut ot_states {
-            DistributedSilentOt::process_round3(s, &r3_msgs).unwrap();
+        let mut r3 = vec![Vec::new(); n];
+        for s in ot_states.iter() {
+            for (to, seed) in DistributedSilentOt::round3_seed_reveals(s) {
+                r3[to].push((s.party_id, seed));
+            }
+        }
+        for (i, s) in ot_states.iter_mut().enumerate() {
+            DistributedSilentOt::process_round3(s, &r3[i]).unwrap();
         }
 
         let ot_correlations: Vec<_> = ot_states

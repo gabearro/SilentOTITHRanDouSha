@@ -8,7 +8,7 @@ use silent_ot_randousha::randousha::{
 };
 use silent_ot_randousha::shamir::{Shamir, Share};
 use silent_ot_randousha::silent_ot::{
-    Block, DistributedMessage, DistributedSilentOt, SilentOtParams,
+    Block, DistributedSilentOt, SilentOtParams,
 };
 
 use rand::SeedableRng;
@@ -132,79 +132,37 @@ async fn run_silent_ot_setup_n(
     let protocol = DistributedSilentOt::new(ot_params);
     let mut ot_state = protocol.init_party(party_id, rng);
 
-    let r0_msgs = DistributedSilentOt::round0_commitments(&ot_state);
-    for msg in &r0_msgs {
-        if let DistributedMessage::Commitment {
-            to, commitment, ..
-        } = msg
-        {
-            net.send(*to, 0, 0, commitment).await.unwrap();
-        }
+    // Round 0: commitments
+    for (to, commitment) in DistributedSilentOt::round0_commitments(&ot_state) {
+        net.send(to, 0, 0, &commitment).await.unwrap();
     }
     let commitments: HashMap<usize, [u8; 32]> = net.recv_from_all(0, 0).await.unwrap();
-    let dist_r0: Vec<DistributedMessage> = commitments
-        .iter()
-        .map(|(from, c)| DistributedMessage::Commitment {
-            from: *from,
-            to: party_id,
-            commitment: *c,
-        })
-        .collect();
-    DistributedSilentOt::process_round0(&mut ot_state, &dist_r0).unwrap();
+    let r0: Vec<(usize, [u8; 32])> = commitments.into_iter().collect();
+    DistributedSilentOt::process_round0(&mut ot_state, &r0).unwrap();
 
-    let r1_msgs = DistributedSilentOt::round1_puncture_choices(&ot_state);
-    for msg in &r1_msgs {
-        if let DistributedMessage::PunctureChoice { to, index, .. } = msg {
-            net.send(*to, 0, 1, index).await.unwrap();
-        }
+    // Round 1: puncture choices
+    for (to, index) in DistributedSilentOt::round1_puncture_choices(&ot_state) {
+        net.send(to, 0, 1, &index).await.unwrap();
     }
     let choices: HashMap<usize, usize> = net.recv_from_all(0, 1).await.unwrap();
-    let dist_r1: Vec<DistributedMessage> = choices
-        .iter()
-        .map(|(from, idx)| DistributedMessage::PunctureChoice {
-            from: *from,
-            to: party_id,
-            index: *idx,
-        })
-        .collect();
-    DistributedSilentOt::process_round1(&mut ot_state, &dist_r1).unwrap();
+    let r1: Vec<(usize, usize)> = choices.into_iter().collect();
+    DistributedSilentOt::process_round1(&mut ot_state, &r1).unwrap();
 
-    let r2_msgs = DistributedSilentOt::round2_sibling_paths(&ot_state).unwrap();
-    for msg in &r2_msgs {
-        if let DistributedMessage::SiblingPathMsg {
-            to, sibling_path, ..
-        } = msg
-        {
-            net.send(*to, 0, 2, sibling_path).await.unwrap();
-        }
+    // Round 2: sibling paths
+    for (to, sibling_path) in DistributedSilentOt::round2_sibling_paths(&ot_state).unwrap() {
+        net.send(to, 0, 2, &sibling_path).await.unwrap();
     }
     let paths: HashMap<usize, Vec<Block>> = net.recv_from_all(0, 2).await.unwrap();
-    let dist_r2: Vec<DistributedMessage> = paths
-        .into_iter()
-        .map(|(from, sp)| DistributedMessage::SiblingPathMsg {
-            from,
-            to: party_id,
-            sibling_path: sp,
-        })
-        .collect();
-    DistributedSilentOt::process_round2(&mut ot_state, &dist_r2).unwrap();
+    let r2: Vec<(usize, Vec<Block>)> = paths.into_iter().collect();
+    DistributedSilentOt::process_round2(&mut ot_state, &r2).unwrap();
 
-    let r3_msgs = DistributedSilentOt::round3_seed_reveals(&ot_state);
-    for msg in &r3_msgs {
-        if let DistributedMessage::SeedReveal { to, seed, .. } = msg {
-            net.send(*to, 0, 3, seed).await.unwrap();
-        }
+    // Round 3: seed reveals
+    for (to, seed) in DistributedSilentOt::round3_seed_reveals(&ot_state) {
+        net.send(to, 0, 3, &seed).await.unwrap();
     }
     let reveals: HashMap<usize, Block> = net.recv_from_all(0, 3).await.unwrap();
-    let dist_r3: Vec<DistributedMessage> = reveals
-        .into_iter()
-        .map(|(from, seed)| DistributedMessage::SeedReveal {
-            from,
-            to: party_id,
-            seed,
-        })
-        .collect();
-    DistributedSilentOt::process_round3(&mut ot_state, &dist_r3).unwrap();
+    let r3: Vec<(usize, Block)> = reveals.into_iter().collect();
+    DistributedSilentOt::process_round3(&mut ot_state, &r3).unwrap();
 
     let correlations = DistributedSilentOt::expand(&ot_state).unwrap();
 
