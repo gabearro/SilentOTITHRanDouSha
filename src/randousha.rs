@@ -375,4 +375,324 @@ mod tests {
         assert!(RanDouShaParams::new(5, 0, 0).is_err());
         assert!(RanDouShaParams::new(4, 2, 5).is_err());
     }
+
+    #[test]
+    #[ignore]
+    fn test_randousha_2m_silent_ot() {
+        use crate::silent_ot::{DistributedSilentOt, SilentOtParams};
+
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let count = 2_000_000;
+        let n = 5;
+        let t = 1;
+        let sharings_per_round = n - 2 * t;
+        let num_rounds = (count + sharings_per_round - 1) / sharings_per_round;
+
+        eprintln!(
+            "generating {} double shares (n={}, t={}, {} HIM rounds)",
+            count, n, t, num_rounds
+        );
+
+        let ot_start = std::time::Instant::now();
+        let ot_params = SilentOtParams::new(n, t, num_rounds).unwrap();
+        let ot_protocol = DistributedSilentOt::new(ot_params);
+        let mut ot_states: Vec<_> =
+            (0..n).map(|i| ot_protocol.init_party(i, &mut rng)).collect();
+
+        let r0_msgs: Vec<_> = ot_states
+            .iter()
+            .flat_map(|s| DistributedSilentOt::round0_commitments(s))
+            .collect();
+        for s in &mut ot_states {
+            DistributedSilentOt::process_round0(s, &r0_msgs).unwrap();
+        }
+
+        let r1_msgs: Vec<_> = ot_states
+            .iter()
+            .flat_map(|s| DistributedSilentOt::round1_puncture_choices(s))
+            .collect();
+        for s in &mut ot_states {
+            DistributedSilentOt::process_round1(s, &r1_msgs).unwrap();
+        }
+
+        let mut r2_msgs = Vec::new();
+        for s in &ot_states {
+            r2_msgs.extend(DistributedSilentOt::round2_sibling_paths(s).unwrap());
+        }
+        for s in &mut ot_states {
+            DistributedSilentOt::process_round2(s, &r2_msgs).unwrap();
+        }
+
+        let r3_msgs: Vec<_> = ot_states
+            .iter()
+            .flat_map(|s| DistributedSilentOt::round3_seed_reveals(s))
+            .collect();
+        for s in &ot_states {
+            DistributedSilentOt::process_round3(s, &r3_msgs).unwrap();
+        }
+
+        let ot_correlations: Vec<_> = ot_states
+            .iter()
+            .map(|s| DistributedSilentOt::expand(s).unwrap())
+            .collect();
+        let ot_elapsed = ot_start.elapsed();
+        eprintln!("silent OT setup: {:.2?}", ot_elapsed);
+
+        let him_start = std::time::Instant::now();
+        let shamir_t = Shamir::new(n, t).unwrap();
+        let shamir_2t = Shamir::new(n, 2 * t).unwrap();
+        let him = HyperInvertibleMatrix::new(n);
+        let mut all_party_shares: Vec<Vec<DoubleShare>> = vec![Vec::new(); n];
+
+        for round in 0..num_rounds {
+            let secrets: Vec<Fp> = (0..n)
+                .map(|i| ot_correlations[i].get_random(round))
+                .collect();
+
+            let mut all_shares_t: Vec<Vec<Share>> = Vec::with_capacity(n);
+            let mut all_shares_2t: Vec<Vec<Share>> = Vec::with_capacity(n);
+            for i in 0..n {
+                all_shares_t.push(shamir_t.share(secrets[i], &mut rng));
+                all_shares_2t.push(shamir_2t.share(secrets[i], &mut rng));
+            }
+
+            for j in 0..sharings_per_round {
+                if all_party_shares[0].len() >= count {
+                    break;
+                }
+
+                let shares_t_out: Vec<Share> = (0..n)
+                    .map(|p| {
+                        let point = shamir_t.eval_points[p];
+                        let val: Fp = (0..n)
+                            .map(|i| him.get(j, i) * all_shares_t[i][p].value)
+                            .sum();
+                        Share { point, value: val }
+                    })
+                    .collect();
+
+                let shares_2t_out: Vec<Share> = (0..n)
+                    .map(|p| {
+                        let point = shamir_2t.eval_points[p];
+                        let val: Fp = (0..n)
+                            .map(|i| him.get(j, i) * all_shares_2t[i][p].value)
+                            .sum();
+                        Share { point, value: val }
+                    })
+                    .collect();
+
+                for p in 0..n {
+                    all_party_shares[p].push(DoubleShare {
+                        share_t: shares_t_out[p],
+                        share_2t: shares_2t_out[p],
+                    });
+                }
+            }
+        }
+
+        for shares in &mut all_party_shares {
+            shares.truncate(count);
+        }
+        let him_elapsed = him_start.elapsed();
+        eprintln!("HIM generation: {:.2?}", him_elapsed);
+        eprintln!(
+            "total: {:.2?}",
+            ot_elapsed + him_elapsed
+        );
+
+        assert_eq!(all_party_shares.len(), n);
+        for shares in &all_party_shares {
+            assert_eq!(shares.len(), count);
+        }
+
+        let verify_start = std::time::Instant::now();
+        assert!(RanDouShaProtocol::verify(&all_party_shares, n, t).unwrap());
+        eprintln!("verified {} double shares in {:.2?}", count, verify_start.elapsed());
+    }
+
+    #[test]
+    #[ignore]
+    fn test_2m_double_shares_chain_multiply() {
+        use crate::multiply::multiply_sequence;
+        use crate::silent_ot::{DistributedSilentOt, SilentOtParams};
+
+        let mut rng = ChaCha20Rng::seed_from_u64(12345);
+        let n = 5;
+        let t = 1;
+        let num_mults = 2_000_000;
+        let num_values = num_mults + 1;
+        let sharings_per_round = n - 2 * t;
+        let num_rounds = (num_mults + sharings_per_round - 1) / sharings_per_round;
+
+        eprintln!(
+            "=== 2M chain multiply: {} multiplications (n={}, t={}, {} HIM rounds) ===",
+            num_mults, n, t, num_rounds
+        );
+
+        // --- Silent OT setup ---
+        let ot_start = std::time::Instant::now();
+        let ot_params = SilentOtParams::new(n, t, num_rounds).unwrap();
+        let ot_protocol = DistributedSilentOt::new(ot_params);
+        let mut ot_states: Vec<_> =
+            (0..n).map(|i| ot_protocol.init_party(i, &mut rng)).collect();
+
+        let r0_msgs: Vec<_> = ot_states
+            .iter()
+            .flat_map(|s| DistributedSilentOt::round0_commitments(s))
+            .collect();
+        for s in &mut ot_states {
+            DistributedSilentOt::process_round0(s, &r0_msgs).unwrap();
+        }
+
+        let r1_msgs: Vec<_> = ot_states
+            .iter()
+            .flat_map(|s| DistributedSilentOt::round1_puncture_choices(s))
+            .collect();
+        for s in &mut ot_states {
+            DistributedSilentOt::process_round1(s, &r1_msgs).unwrap();
+        }
+
+        let mut r2_msgs = Vec::new();
+        for s in &ot_states {
+            r2_msgs.extend(DistributedSilentOt::round2_sibling_paths(s).unwrap());
+        }
+        for s in &mut ot_states {
+            DistributedSilentOt::process_round2(s, &r2_msgs).unwrap();
+        }
+
+        let r3_msgs: Vec<_> = ot_states
+            .iter()
+            .flat_map(|s| DistributedSilentOt::round3_seed_reveals(s))
+            .collect();
+        for s in &ot_states {
+            DistributedSilentOt::process_round3(s, &r3_msgs).unwrap();
+        }
+
+        let ot_correlations: Vec<_> = ot_states
+            .iter()
+            .map(|s| DistributedSilentOt::expand(s).unwrap())
+            .collect();
+        let ot_elapsed = ot_start.elapsed();
+        eprintln!("silent OT setup + expand: {:.2?}", ot_elapsed);
+
+        // --- HIM: generate double shares from OT correlations ---
+        let him_start = std::time::Instant::now();
+        let shamir_t = Shamir::new(n, t).unwrap();
+        let shamir_2t = Shamir::new(n, 2 * t).unwrap();
+        let him = HyperInvertibleMatrix::new(n);
+        let mut all_party_shares: Vec<Vec<DoubleShare>> = vec![Vec::new(); n];
+
+        for round in 0..num_rounds {
+            let secrets: Vec<Fp> = (0..n)
+                .map(|i| ot_correlations[i].get_random(round))
+                .collect();
+
+            let mut all_shares_t: Vec<Vec<Share>> = Vec::with_capacity(n);
+            let mut all_shares_2t: Vec<Vec<Share>> = Vec::with_capacity(n);
+            for i in 0..n {
+                all_shares_t.push(shamir_t.share(secrets[i], &mut rng));
+                all_shares_2t.push(shamir_2t.share(secrets[i], &mut rng));
+            }
+
+            for j in 0..sharings_per_round {
+                if all_party_shares[0].len() >= num_mults {
+                    break;
+                }
+
+                let shares_t_out: Vec<Share> = (0..n)
+                    .map(|p| {
+                        let point = shamir_t.eval_points[p];
+                        let val: Fp = (0..n)
+                            .map(|i| him.get(j, i) * all_shares_t[i][p].value)
+                            .sum();
+                        Share { point, value: val }
+                    })
+                    .collect();
+
+                let shares_2t_out: Vec<Share> = (0..n)
+                    .map(|p| {
+                        let point = shamir_2t.eval_points[p];
+                        let val: Fp = (0..n)
+                            .map(|i| him.get(j, i) * all_shares_2t[i][p].value)
+                            .sum();
+                        Share { point, value: val }
+                    })
+                    .collect();
+
+                for p in 0..n {
+                    all_party_shares[p].push(DoubleShare {
+                        share_t: shares_t_out[p],
+                        share_2t: shares_2t_out[p],
+                    });
+                }
+            }
+        }
+
+        for shares in &mut all_party_shares {
+            shares.truncate(num_mults);
+        }
+        let him_elapsed = him_start.elapsed();
+        eprintln!("HIM generation: {:.2?}", him_elapsed);
+        eprintln!(
+            "offline total (OT + HIM): {:.2?}",
+            ot_elapsed + him_elapsed
+        );
+
+        // --- Verify a sample of double shares ---
+        let verify_start = std::time::Instant::now();
+        let sample_size = 1000;
+        let sample_shares: Vec<Vec<DoubleShare>> = (0..n)
+            .map(|p| all_party_shares[p][..sample_size].to_vec())
+            .collect();
+        assert!(RanDouShaProtocol::verify(&sample_shares, n, t).unwrap());
+        eprintln!(
+            "verified {} sample double shares in {:.2?}",
+            sample_size,
+            verify_start.elapsed()
+        );
+
+        // --- Online phase: chain multiply 2M+1 values ---
+        // Cyclic values 2..=8 to keep things predictable
+        let values: Vec<Fp> = (0..num_values)
+            .map(|i| Fp::new((i % 7 + 2) as u64))
+            .collect();
+
+        let expected: Fp = values.iter().copied().reduce(|a, b| a * b).unwrap();
+        eprintln!("expected product (mod p): {}", expected);
+
+        let share_start = std::time::Instant::now();
+        let value_shares: Vec<Vec<Share>> = values
+            .iter()
+            .map(|v| shamir_t.share(*v, &mut rng))
+            .collect();
+
+        // Reshape: double_shares[k][p] for multiplication k, party p
+        let double_shares: Vec<Vec<DoubleShare>> = (0..num_mults)
+            .map(|k| (0..n).map(|p| all_party_shares[p][k].clone()).collect())
+            .collect();
+        eprintln!("sharing + reshape: {:.2?}", share_start.elapsed());
+
+        let online_start = std::time::Instant::now();
+        let result_shares =
+            multiply_sequence(n, t, 0, &value_shares, &double_shares).unwrap();
+        let online_elapsed = online_start.elapsed();
+        eprintln!(
+            "online phase ({} multiplications): {:.2?}",
+            num_mults, online_elapsed
+        );
+
+        // Reveal
+        let result = shamir_t.reconstruct(&result_shares).unwrap();
+        assert_eq!(
+            result, expected,
+            "chain multiply result mismatch: got {} expected {}",
+            result, expected
+        );
+        eprintln!("revealed result: {} (correct!)", result);
+        eprintln!(
+            "grand total: {:.2?}",
+            ot_elapsed + him_elapsed + online_elapsed
+        );
+        eprintln!("=== PASSED ===");
+    }
 }

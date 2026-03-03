@@ -3,6 +3,7 @@ use crate::field::Fp;
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::Aes128;
 use rand::Rng;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
@@ -29,13 +30,22 @@ impl Block {
     }
 
     pub fn to_field_element(&self, domain: u64) -> Fp {
-        let mut hasher = Sha256::new();
-        hasher.update(b"SilentOT-v1:");
-        hasher.update(self.0);
-        hasher.update(domain.to_le_bytes());
-        let hash = hasher.finalize();
+        // Matyas-Meyer-Oseas: H(m) = E_m(x) XOR x
+        // XOR domain separator into the block, encrypt with fixed key, XOR back
+        let domain_bytes = domain.to_le_bytes();
+        let mut input = self.0;
+        for i in 0..8 {
+            input[i] ^= domain_bytes[i];
+        }
+        let mut aes_block = aes::Block::from(input);
+        prg_key_field().encrypt_block(&mut aes_block);
+        let encrypted: [u8; 16] = aes_block.into();
+        let mut out = [0u8; 16];
+        for i in 0..16 {
+            out[i] = encrypted[i] ^ input[i];
+        }
         let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&hash[..8]);
+        bytes.copy_from_slice(&out[..8]);
         Fp::new(u64::from_le_bytes(bytes))
     }
 
@@ -65,6 +75,10 @@ const PRG_KEY_RIGHT: [u8; 16] = [
     0x51, 0x0e, 0x52, 0x7f, 0xad, 0xe6, 0x82, 0xd1, 0x9b, 0x05, 0x68, 0x8c, 0x2b, 0x3e, 0x6c,
     0x1f,
 ];
+const PRG_KEY_FIELD: [u8; 16] = [
+    0x42, 0x8a, 0x2f, 0x98, 0x71, 0x37, 0x44, 0x91, 0xb5, 0xc0, 0xfb, 0xcf, 0xe9, 0xb5, 0xdb,
+    0xa5,
+];
 
 fn prg_key_left() -> &'static Aes128 {
     static KEY: OnceLock<Aes128> = OnceLock::new();
@@ -74,6 +88,11 @@ fn prg_key_left() -> &'static Aes128 {
 fn prg_key_right() -> &'static Aes128 {
     static KEY: OnceLock<Aes128> = OnceLock::new();
     KEY.get_or_init(|| Aes128::new_from_slice(&PRG_KEY_RIGHT).unwrap())
+}
+
+fn prg_key_field() -> &'static Aes128 {
+    static KEY: OnceLock<Aes128> = OnceLock::new();
+    KEY.get_or_init(|| Aes128::new_from_slice(&PRG_KEY_FIELD).unwrap())
 }
 
 #[inline]
@@ -104,13 +123,27 @@ impl GgmTree {
     pub fn expand_full(&self, root: &Block) -> Vec<Block> {
         let mut current_level = vec![*root];
         for _ in 0..self.depth {
-            let mut next_level = Vec::with_capacity(current_level.len() * 2);
-            for node in &current_level {
-                let (left, right) = prg_expand(node);
-                next_level.push(left);
-                next_level.push(right);
+            let len = current_level.len();
+            if len >= 256 {
+                let mut next_level = vec![Block::ZERO; len * 2];
+                current_level
+                    .par_iter()
+                    .zip(next_level.par_chunks_exact_mut(2))
+                    .for_each(|(node, pair)| {
+                        let (left, right) = prg_expand(node);
+                        pair[0] = left;
+                        pair[1] = right;
+                    });
+                current_level = next_level;
+            } else {
+                let mut next_level = Vec::with_capacity(len * 2);
+                for node in &current_level {
+                    let (left, right) = prg_expand(node);
+                    next_level.push(left);
+                    next_level.push(right);
+                }
+                current_level = next_level;
             }
-            current_level = next_level;
         }
         current_level
     }
@@ -125,26 +158,18 @@ impl GgmTree {
         }
 
         let mut sibling_path = Vec::with_capacity(self.depth);
-        let mut current_level = vec![*root];
+        let mut current = *root;
 
         for level in 0..self.depth {
-            let parent_idx = puncture_idx >> (self.depth - level);
             let puncture_bit = (puncture_idx >> (self.depth - 1 - level)) & 1;
-
-            let mut next_level = Vec::with_capacity(current_level.len() * 2);
-            for (i, node) in current_level.iter().enumerate() {
-                let (left, right) = prg_expand(node);
-                if i == parent_idx {
-                    if puncture_bit == 0 {
-                        sibling_path.push(right);
-                    } else {
-                        sibling_path.push(left);
-                    }
-                }
-                next_level.push(left);
-                next_level.push(right);
+            let (left, right) = prg_expand(&current);
+            if puncture_bit == 0 {
+                sibling_path.push(right);
+                current = left;
+            } else {
+                sibling_path.push(left);
+                current = right;
             }
-            current_level = next_level;
         }
 
         Ok(sibling_path)
@@ -171,21 +196,37 @@ impl GgmTree {
         }
 
         let n = self.num_leaves();
+
+        // Precompute subtree metadata
+        let subtree_info: Vec<(usize, usize, &Block)> = sibling_path
+            .iter()
+            .enumerate()
+            .map(|(level, sibling)| {
+                let subtree_depth = self.depth - 1 - level;
+                let subtree_size = 1usize << subtree_depth;
+                let parent_idx = puncture_idx >> (self.depth - level);
+                let puncture_bit = (puncture_idx >> (self.depth - 1 - level)) & 1;
+                let sibling_start = if puncture_bit == 0 {
+                    (parent_idx * 2 + 1) * subtree_size
+                } else {
+                    (parent_idx * 2) * subtree_size
+                };
+                (subtree_depth, sibling_start, sibling)
+            })
+            .collect();
+
+        // Expand subtrees in parallel
+        let expanded: Vec<(usize, Vec<Block>)> = subtree_info
+            .par_iter()
+            .map(|&(subtree_depth, sibling_start, sibling)| {
+                let subtree_leaves = GgmTree::new(subtree_depth).expand_full(sibling);
+                (sibling_start, subtree_leaves)
+            })
+            .collect();
+
+        // Merge results sequentially into leaves
         let mut leaves = vec![Block::ZERO; n];
-
-        for (level, sibling) in sibling_path.iter().enumerate() {
-            let subtree_depth = self.depth - 1 - level;
-            let subtree_size = 1usize << subtree_depth;
-            let parent_idx = puncture_idx >> (self.depth - level);
-            let puncture_bit = (puncture_idx >> (self.depth - 1 - level)) & 1;
-
-            let sibling_start = if puncture_bit == 0 {
-                (parent_idx * 2 + 1) * subtree_size
-            } else {
-                (parent_idx * 2) * subtree_size
-            };
-
-            let subtree_leaves = GgmTree::new(subtree_depth).expand_full(sibling);
+        for (sibling_start, subtree_leaves) in expanded {
             for (i, leaf) in subtree_leaves.into_iter().enumerate() {
                 let global_idx = sibling_start + i;
                 if global_idx < n {
@@ -509,10 +550,10 @@ impl DistributedSilentOt {
     pub fn expand(state: &PartySetupState) -> Result<ExpandedCorrelations> {
         Self::validate_state(state)?;
 
-        let tree = GgmTree::new(state.tree_depth);
         let n = state.n;
         let num_ots = state.num_ots;
-        let num_leaves = tree.num_leaves();
+        let tree_depth = state.tree_depth;
+        let num_leaves = 1 << tree_depth;
 
         if num_ots > num_leaves {
             return Err(ProtocolError::InvalidParams(format!(
@@ -521,32 +562,48 @@ impl DistributedSilentOt {
             )));
         }
 
+        // Collect peer indices for parallel processing
+        let peers: Vec<usize> = (0..n).filter(|&j| j != state.party_id).collect();
+
+        // Process all peers in parallel
+        let results: Vec<(usize, Vec<Fp>, Vec<Fp>)> = peers
+            .par_iter()
+            .map(|&j| {
+                let tree = GgmTree::new(tree_depth);
+
+                let sender_vals = if let Some(seed) = state.my_seeds[j] {
+                    let leaves = tree.expand_full(&seed);
+                    (0..num_ots)
+                        .map(|k| leaves[k].to_field_element(k as u64))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                let receiver_vals = if let (Some(sibling_path), Some(puncture_idx)) = (
+                    &state.received_sibling_paths[j],
+                    state.my_puncture_indices[j],
+                ) {
+                    let leaves = tree
+                        .reconstruct_from_siblings(sibling_path, puncture_idx)
+                        .expect("sibling path reconstruction failed");
+                    (0..num_ots)
+                        .map(|k| leaves[k].to_field_element(k as u64))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                (j, sender_vals, receiver_vals)
+            })
+            .collect();
+
+        // Reassemble into vecs indexed by party
         let mut sender_values: Vec<Vec<Fp>> = vec![Vec::new(); n];
         let mut receiver_values: Vec<Vec<Fp>> = vec![Vec::new(); n];
-
-        for j in 0..n {
-            if j == state.party_id {
-                continue;
-            }
-
-            if let Some(seed) = state.my_seeds[j] {
-                let leaves = tree.expand_full(&seed);
-                let vals: Vec<Fp> = (0..num_ots)
-                    .map(|k| leaves[k].to_field_element(k as u64))
-                    .collect();
-                sender_values[j] = vals;
-            }
-
-            if let (Some(sibling_path), Some(puncture_idx)) = (
-                &state.received_sibling_paths[j],
-                state.my_puncture_indices[j],
-            ) {
-                let leaves = tree.reconstruct_from_siblings(sibling_path, puncture_idx)?;
-                let vals: Vec<Fp> = (0..num_ots)
-                    .map(|k| leaves[k].to_field_element(k as u64))
-                    .collect();
-                receiver_values[j] = vals;
-            }
+        for (j, sv, rv) in results {
+            sender_values[j] = sv;
+            receiver_values[j] = rv;
         }
 
         let mut puncture_indices: Vec<Option<usize>> = vec![None; n];
