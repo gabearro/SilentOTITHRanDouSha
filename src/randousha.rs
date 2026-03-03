@@ -80,6 +80,8 @@ impl RanDouShaProtocol {
     }
 
     pub fn generate_local<R: Rng>(&self, rng: &mut R) -> Result<Vec<Vec<DoubleShare>>> {
+        use rayon::prelude::*;
+
         let n = self.params.n;
         let t = self.params.t;
         let count = self.params.count;
@@ -124,13 +126,19 @@ impl RanDouShaProtocol {
         }
 
         let ot_correlations: Vec<ExpandedCorrelations> = ot_states
-            .iter()
-            .map(DistributedSilentOt::expand)
+            .par_iter()
+            .map(|s| DistributedSilentOt::expand(s))
             .collect::<Result<_>>()?;
 
         let him = HyperInvertibleMatrix::new(n);
         let sharings_per_round = n - 2 * t;
         let num_rounds = count.div_ceil(sharings_per_round);
+
+        let him_rows: Vec<Vec<Fp>> = (0..n)
+            .map(|row| (0..n).map(|col| him.get(row, col)).collect())
+            .collect();
+        let lagrange_t = shamir_t.lagrange_coefficients();
+        let lagrange_2t = shamir_2t.lagrange_coefficients();
 
         let mut all_party_shares: Vec<Vec<DoubleShare>> = vec![Vec::new(); n];
 
@@ -152,57 +160,38 @@ impl RanDouShaProtocol {
                     break;
                 }
 
-                let shares_t_out: Vec<Share> = (0..n)
-                    .map(|p| {
-                        let point = shamir_t.eval_points[p];
-                        let val: Fp = (0..n)
-                            .map(|i| him.get(j, i) * all_shares_t[i][p].value)
-                            .sum();
-                        Share { point, value: val }
-                    })
-                    .collect();
-
-                let shares_2t_out: Vec<Share> = (0..n)
-                    .map(|p| {
-                        let point = shamir_2t.eval_points[p];
-                        let val: Fp = (0..n)
-                            .map(|i| him.get(j, i) * all_shares_2t[i][p].value)
-                            .sum();
-                        Share { point, value: val }
-                    })
-                    .collect();
-
                 for p in 0..n {
+                    let val_t: Fp = (0..n)
+                        .map(|i| him_rows[j][i] * all_shares_t[i][p].value)
+                        .sum();
+                    let val_2t: Fp = (0..n)
+                        .map(|i| him_rows[j][i] * all_shares_2t[i][p].value)
+                        .sum();
                     all_party_shares[p].push(DoubleShare {
-                        share_t: shares_t_out[p],
-                        share_2t: shares_2t_out[p],
+                        share_t: Share { point: shamir_t.eval_points[p], value: val_t },
+                        share_2t: Share { point: shamir_2t.eval_points[p], value: val_2t },
                     });
                 }
             }
 
             for check_row in sharings_per_round..n {
-                let shares_t_check: Vec<Share> = (0..n)
+                let secret_t: Fp = (0..n)
                     .map(|p| {
-                        let point = shamir_t.eval_points[p];
                         let val: Fp = (0..n)
-                            .map(|i| him.get(check_row, i) * all_shares_t[i][p].value)
+                            .map(|i| him_rows[check_row][i] * all_shares_t[i][p].value)
                             .sum();
-                        Share { point, value: val }
+                        lagrange_t[p] * val
                     })
-                    .collect();
+                    .sum();
 
-                let shares_2t_check: Vec<Share> = (0..n)
+                let secret_2t: Fp = (0..n)
                     .map(|p| {
-                        let point = shamir_2t.eval_points[p];
                         let val: Fp = (0..n)
-                            .map(|i| him.get(check_row, i) * all_shares_2t[i][p].value)
+                            .map(|i| him_rows[check_row][i] * all_shares_2t[i][p].value)
                             .sum();
-                        Share { point, value: val }
+                        lagrange_2t[p] * val
                     })
-                    .collect();
-
-                let secret_t = shamir_t.reconstruct(&shares_t_check)?;
-                let secret_2t = shamir_2t.reconstruct(&shares_2t_check)?;
+                    .sum();
 
                 if secret_t != secret_2t {
                     return Err(ProtocolError::MaliciousParty(format!(
@@ -513,8 +502,9 @@ mod tests {
     #[test]
     #[ignore]
     fn test_2m_double_shares_chain_multiply() {
-        use crate::multiply::multiply_sequence;
+        use crate::multiply::multiply_sequence_party_indexed;
         use crate::silent_ot::{DistributedSilentOt, SilentOtParams};
+        use rayon::prelude::*;
 
         let mut rng = ChaCha20Rng::seed_from_u64(12345);
         let n: usize = 5;
@@ -568,7 +558,7 @@ mod tests {
         }
 
         let ot_correlations: Vec<_> = ot_states
-            .iter()
+            .par_iter()
             .map(|s| DistributedSilentOt::expand(s).unwrap())
             .collect();
         let ot_elapsed = ot_start.elapsed();
@@ -578,51 +568,66 @@ mod tests {
         let shamir_t = Shamir::new(n, t).unwrap();
         let shamir_2t = Shamir::new(n, 2 * t).unwrap();
         let him = HyperInvertibleMatrix::new(n);
-        let mut all_party_shares: Vec<Vec<DoubleShare>> = vec![Vec::new(); n];
 
-        for round in 0..num_rounds {
-            let secrets: Vec<Fp> = (0..n)
-                .map(|i| ot_correlations[i].get_random(round))
-                .collect();
+        let him_rows_flat: Vec<Vec<Fp>> = (0..n)
+            .map(|j| (0..n).map(|i| him.get(j, i)).collect())
+            .collect();
+        let eval_points_t: Vec<Fp> = shamir_t.eval_points.clone();
+        let eval_points_2t: Vec<Fp> = shamir_2t.eval_points.clone();
 
-            let mut all_shares_t: Vec<Vec<Share>> = Vec::with_capacity(n);
-            let mut all_shares_2t: Vec<Vec<Share>> = Vec::with_capacity(n);
-            for i in 0..n {
-                all_shares_t.push(shamir_t.share(secrets[i], &mut rng));
-                all_shares_2t.push(shamir_2t.share(secrets[i], &mut rng));
-            }
+        let round_seeds: Vec<u64> = (0..num_rounds).map(|_| rng.gen()).collect();
 
-            for j in 0..sharings_per_round {
+        let round_results: Vec<Vec<(Share, Share)>> = (0..num_rounds)
+            .into_par_iter()
+            .map(|round| {
+                let mut local_rng = ChaCha20Rng::seed_from_u64(round_seeds[round]);
+                let secrets: Vec<Fp> = (0..n)
+                    .map(|i| ot_correlations[i].get_random(round))
+                    .collect();
+
+                let mut all_shares_t: Vec<Vec<Share>> = Vec::with_capacity(n);
+                let mut all_shares_2t: Vec<Vec<Share>> = Vec::with_capacity(n);
+                for i in 0..n {
+                    all_shares_t.push(shamir_t.share(secrets[i], &mut local_rng));
+                    all_shares_2t.push(shamir_2t.share(secrets[i], &mut local_rng));
+                }
+
+                let mut out = Vec::with_capacity(sharings_per_round * n);
+                for j in 0..sharings_per_round {
+                    for p in 0..n {
+                        let val_t: Fp = (0..n)
+                            .map(|i| him_rows_flat[j][i] * all_shares_t[i][p].value)
+                            .sum();
+                        let val_2t: Fp = (0..n)
+                            .map(|i| him_rows_flat[j][i] * all_shares_2t[i][p].value)
+                            .sum();
+                        out.push((
+                            Share { point: eval_points_t[p], value: val_t },
+                            Share { point: eval_points_2t[p], value: val_2t },
+                        ));
+                    }
+                }
+                out
+            })
+            .collect();
+
+        let mut all_party_shares: Vec<Vec<DoubleShare>> =
+            (0..n).map(|_| Vec::with_capacity(num_mults)).collect();
+
+        for round_out in &round_results {
+            for chunk in round_out.chunks_exact(n) {
                 if all_party_shares[0].len() >= num_mults {
                     break;
                 }
-
-                let shares_t_out: Vec<Share> = (0..n)
-                    .map(|p| {
-                        let point = shamir_t.eval_points[p];
-                        let val: Fp = (0..n)
-                            .map(|i| him.get(j, i) * all_shares_t[i][p].value)
-                            .sum();
-                        Share { point, value: val }
-                    })
-                    .collect();
-
-                let shares_2t_out: Vec<Share> = (0..n)
-                    .map(|p| {
-                        let point = shamir_2t.eval_points[p];
-                        let val: Fp = (0..n)
-                            .map(|i| him.get(j, i) * all_shares_2t[i][p].value)
-                            .sum();
-                        Share { point, value: val }
-                    })
-                    .collect();
-
                 for p in 0..n {
                     all_party_shares[p].push(DoubleShare {
-                        share_t: shares_t_out[p],
-                        share_2t: shares_2t_out[p],
+                        share_t: chunk[p].0,
+                        share_2t: chunk[p].1,
                     });
                 }
+            }
+            if all_party_shares[0].len() >= num_mults {
+                break;
             }
         }
 
@@ -656,19 +661,25 @@ mod tests {
         eprintln!("expected product (mod p): {}", expected);
 
         let share_start = std::time::Instant::now();
-        let value_shares: Vec<Vec<Share>> = values
-            .iter()
-            .map(|v| shamir_t.share(*v, &mut rng))
+        let num_chunks = rayon::current_num_threads();
+        let chunk_size = num_values.div_ceil(num_chunks);
+        let chunk_seeds: Vec<u64> = (0..num_chunks).map(|_| rng.gen()).collect();
+        let value_shares: Vec<Vec<Share>> = (0..num_chunks)
+            .into_par_iter()
+            .flat_map(|chunk_idx| {
+                let start = chunk_idx * chunk_size;
+                let end = (start + chunk_size).min(num_values);
+                let mut local_rng = ChaCha20Rng::seed_from_u64(chunk_seeds[chunk_idx]);
+                (start..end)
+                    .map(|i| shamir_t.share(values[i], &mut local_rng))
+                    .collect::<Vec<_>>()
+            })
             .collect();
-
-        let double_shares: Vec<Vec<DoubleShare>> = (0..num_mults)
-            .map(|k| (0..n).map(|p| all_party_shares[p][k].clone()).collect())
-            .collect();
-        eprintln!("sharing + reshape: {:.2?}", share_start.elapsed());
+        eprintln!("sharing: {:.2?}", share_start.elapsed());
 
         let online_start = std::time::Instant::now();
         let result_shares =
-            multiply_sequence(n, t, 0, &value_shares, &double_shares).unwrap();
+            multiply_sequence_party_indexed(n, t, &value_shares, &all_party_shares).unwrap();
         let online_elapsed = online_start.elapsed();
         eprintln!(
             "online phase ({} multiplications): {:.2?}",

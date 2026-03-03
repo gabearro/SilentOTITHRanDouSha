@@ -112,7 +112,7 @@ impl DnMultiply {
 pub fn multiply_sequence(
     n: usize,
     t: usize,
-    king: usize,
+    _king: usize,
     value_shares: &[Vec<Share>],
     double_shares: &[Vec<DoubleShare>],
 ) -> Result<Vec<Share>> {
@@ -131,12 +131,79 @@ pub fn multiply_sequence(
         )));
     }
 
-    let dn = DnMultiply::new(n, t, king)?;
+    let shamir_2t = Shamir::new(n, 2 * t)?;
+    let lagrange = shamir_2t.lagrange_coefficients();
     let mut current: Vec<Share> = value_shares[0].clone();
 
     for i in 1..m {
-        let ds: Vec<DoubleShare> = (0..n).map(|p| double_shares[i - 1][p].clone()).collect();
-        current = dn.multiply_local(&current, &value_shares[i], &ds)?;
+        let mut opened = Fp::ZERO;
+        for p in 0..n {
+            let masked = current[p].value * value_shares[i][p].value
+                + double_shares[i - 1][p].share_2t.value;
+            opened += lagrange[p] * masked;
+        }
+
+        for p in 0..n {
+            current[p] = Share {
+                point: double_shares[i - 1][p].share_t.point,
+                value: opened - double_shares[i - 1][p].share_t.value,
+            };
+        }
+    }
+
+    Ok(current)
+}
+
+pub fn multiply_sequence_party_indexed(
+    n: usize,
+    t: usize,
+    value_shares: &[Vec<Share>],
+    party_double_shares: &[Vec<DoubleShare>],
+) -> Result<Vec<Share>> {
+    let m = value_shares.len();
+    if m < 2 {
+        return Err(ProtocolError::InvalidParams(
+            "need at least 2 values to multiply".into(),
+        ));
+    }
+    let num_mults = m - 1;
+    if party_double_shares.len() != n {
+        return Err(ProtocolError::InvalidParams(format!(
+            "need {} party share vectors, got {}",
+            n,
+            party_double_shares.len()
+        )));
+    }
+    for p in 0..n {
+        if party_double_shares[p].len() < num_mults {
+            return Err(ProtocolError::InvalidParams(format!(
+                "party {} has {} double shares, need {}",
+                p,
+                party_double_shares[p].len(),
+                num_mults
+            )));
+        }
+    }
+
+    let shamir_2t = Shamir::new(n, 2 * t)?;
+    let lagrange = shamir_2t.lagrange_coefficients();
+    let mut current: Vec<Share> = value_shares[0].clone();
+
+    for i in 1..m {
+        let k = i - 1;
+        let mut opened = Fp::ZERO;
+        for p in 0..n {
+            let masked = current[p].value * value_shares[i][p].value
+                + party_double_shares[p][k].share_2t.value;
+            opened += lagrange[p] * masked;
+        }
+
+        for p in 0..n {
+            current[p] = Share {
+                point: party_double_shares[p][k].share_t.point,
+                value: opened - party_double_shares[p][k].share_t.value,
+            };
+        }
     }
 
     Ok(current)

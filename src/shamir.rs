@@ -13,6 +13,7 @@ pub struct Shamir {
     pub degree: usize,
     pub n: usize,
     pub eval_points: Vec<Fp>,
+    lagrange_all_at_zero: Vec<Fp>,
 }
 
 impl Shamir {
@@ -24,10 +25,12 @@ impl Shamir {
             )));
         }
         let eval_points: Vec<Fp> = (1..=n as u64).map(Fp::new).collect();
+        let lagrange_all_at_zero = lagrange_coefficients_at_zero(&eval_points);
         Ok(Shamir {
             degree,
             n,
             eval_points,
+            lagrange_all_at_zero,
         })
     }
 
@@ -73,6 +76,21 @@ impl Shamir {
             )));
         }
         lagrange_interpolate_at_zero(shares)
+    }
+
+    #[inline]
+    pub fn lagrange_coefficients(&self) -> &[Fp] {
+        &self.lagrange_all_at_zero
+    }
+
+    #[inline]
+    pub fn reconstruct_all_values(&self, values: &[Fp]) -> Fp {
+        debug_assert_eq!(values.len(), self.n);
+        values
+            .iter()
+            .zip(&self.lagrange_all_at_zero)
+            .map(|(&v, &c)| v * c)
+            .sum()
     }
 }
 
