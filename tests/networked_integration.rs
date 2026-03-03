@@ -577,8 +577,6 @@ async fn test_networked_mass_chained_multiplication() {
     );
 }
 
-/// Helper: run the full offline+online protocol for arbitrary values over a TCP network.
-/// Returns the final opened product for party 0, None for others.
 async fn run_offline_online_multiply(
     net: PartyNetwork,
     party_id: usize,
@@ -591,11 +589,8 @@ async fn run_offline_online_multiply(
     let shamir_2t = Shamir::new(N, 2 * T).unwrap();
     let num_mults = values.len() - 1;
 
-    // ===== OFFLINE PHASE =====
-    // Phase 0: Silent OT setup (generates correlated randomness)
     let ot_randoms = run_silent_ot_setup(&mut bnet, party_id, &mut rng).await;
 
-    // Phase 1: Generate double-shares from OT correlations
     let mut my_contribs: Vec<(Vec<Share>, Vec<Share>)> = Vec::new();
     for k in 0..num_mults {
         let secret = ot_randoms[k % ot_count];
@@ -627,8 +622,6 @@ async fn run_offline_online_multiply(
         });
     }
 
-    // ===== ONLINE PHASE =====
-    // Phase 2: Input sharing (party 0 distributes input shares)
     let num_values = values.len();
     let mut my_input_shares: Vec<Share> = Vec::with_capacity(num_values);
     if party_id == 0 {
@@ -646,7 +639,6 @@ async fn run_offline_online_multiply(
         }
     }
 
-    // Phase 3: Chained multiplications with DN protocol
     let mut current = my_input_shares[0];
     for mult_idx in 0..num_mults {
         let next = my_input_shares[mult_idx + 1];
@@ -679,7 +671,6 @@ async fn run_offline_online_multiply(
         current = DnMultiply::compute_output_share(opened, ds);
     }
 
-    // Phase 4: Reveal (open result to party 0)
     if party_id != 0 {
         bnet.send(0, 4, 0, &current).await.unwrap();
         None
@@ -693,10 +684,6 @@ async fn run_offline_online_multiply(
     }
 }
 
-/// Test mass chained offline multiplications with explicit reveal for 20 values.
-/// This demonstrates the full offline-then-online pipeline:
-/// 1. Offline: Silent OT -> correlated randomness -> double-shares
-/// 2. Online: input sharing -> chained multiplications -> reveal
 #[tokio::test]
 async fn test_mass_chained_offline_multiply_with_reveal_20() {
     let num_values = 20;
@@ -729,8 +716,6 @@ async fn test_mass_chained_offline_multiply_with_reveal_20() {
     eprintln!("=== PASSED: 20-value chained offline multiply+reveal = {} ===", result);
 }
 
-/// Test mass chained offline multiplications with explicit reveal for 50 values.
-/// Demonstrates the protocol handles large batches correctly.
 #[tokio::test]
 async fn test_mass_chained_offline_multiply_with_reveal_50() {
     let num_values = 50;
@@ -759,9 +744,6 @@ async fn test_mass_chained_offline_multiply_with_reveal_50() {
     eprintln!("=== PASSED: 50-value chained offline multiply+reveal = {} ===", result);
 }
 
-/// Test that verifies the full offline/online separation explicitly.
-/// Generates double-shares in a pure offline phase (before knowing inputs),
-/// then uses them in the online phase for multiplication and reveal.
 #[tokio::test]
 async fn test_offline_online_separation_with_reveal() {
     eprintln!("=== Testing explicit offline/online phase separation ===");
@@ -770,7 +752,6 @@ async fn test_offline_online_separation_with_reveal() {
 
     let values = vec![Fp::new(13), Fp::new(17), Fp::new(19), Fp::new(23), Fp::new(29)];
     let expected: Fp = values.iter().copied().reduce(|a, b| a * b).unwrap();
-    // 13 * 17 * 19 * 23 * 29 = 1_847_087 (check at field level)
     let expected_plain = 13u64 * 17 * 19 * 23 * 29;
     assert_eq!(expected, Fp::new(expected_plain));
     eprintln!("Computing: 13 * 17 * 19 * 23 * 29 = {}", expected_plain);
@@ -793,10 +774,6 @@ async fn test_offline_online_separation_with_reveal() {
     eprintln!("=== PASSED: offline/online separation test = {} ===", result);
 }
 
-/// Test that the local RanDouSha verification catches tampered double-shares.
-/// This demonstrates the malicious security model: if any party contributes
-/// incorrect shares during the offline phase, the HIM verification rows
-/// will detect the tampering.
 #[tokio::test]
 async fn test_malicious_double_share_detection() {
     eprintln!("=== Testing malicious double-share detection ===");
@@ -807,23 +784,18 @@ async fn test_malicious_double_share_detection() {
     let params = RanDouShaParams::new(n, t, 5).unwrap();
     let protocol = RanDouShaProtocol::new(params);
 
-    // Generate honest double-shares
     let mut party_shares = protocol.generate_local(&mut rng).unwrap();
 
-    // Verify they pass (honest case)
     assert!(RanDouShaProtocol::verify(&party_shares, n, t).unwrap());
     eprintln!("  Honest double-shares: VERIFIED");
 
-    // Tamper with party 1's degree-t share (simulates malicious party)
     let original = party_shares[1][0].share_t.value;
     party_shares[1][0].share_t.value = original + Fp::new(999);
 
-    // Verify detects tampering
     let result = RanDouShaProtocol::verify(&party_shares, n, t);
     assert!(result.is_err(), "tampered shares must be detected");
     eprintln!("  Tampered degree-t share: DETECTED");
 
-    // Restore and tamper degree-2t instead
     party_shares[1][0].share_t.value = original;
     party_shares[1][0].share_2t.value = party_shares[1][0].share_2t.value + Fp::new(42);
 
@@ -834,8 +806,6 @@ async fn test_malicious_double_share_detection() {
     eprintln!("=== PASSED: malicious double-share detection ===");
 }
 
-/// Test that a malicious king who broadcasts wrong opened values is detectable
-/// using the verify_king_broadcast method.
 #[tokio::test]
 async fn test_malicious_king_detection() {
     eprintln!("=== Testing malicious king detection ===");
@@ -863,17 +833,14 @@ async fn test_malicious_king_detection() {
     let dn = DnMultiply::new(n, t, 0).unwrap();
     let honest_opened = dn.king_reconstruct(&masked_shares).unwrap();
 
-    // Honest king: verification passes
     dn.verify_king_broadcast(&masked_shares, honest_opened).unwrap();
     eprintln!("  Honest king broadcast: VERIFIED");
 
-    // Malicious king sends wrong value
     let malicious_opened = honest_opened + Fp::new(1);
     let result = dn.verify_king_broadcast(&masked_shares, malicious_opened);
     assert!(result.is_err());
     eprintln!("  Malicious king broadcast: DETECTED");
 
-    // Verify correct multiplication result
     let result_shares: Vec<Share> = (0..n)
         .map(|i| DnMultiply::compute_output_share(honest_opened, &ds[i]))
         .collect();
@@ -884,12 +851,9 @@ async fn test_malicious_king_detection() {
     eprintln!("=== PASSED: malicious king detection ===");
 }
 
-/// Stress test: mass chained offline multiplications with 100 values.
-/// Validates the protocol scales correctly with large batch sizes.
 #[tokio::test]
 async fn test_mass_chained_offline_multiply_with_reveal_100() {
     let num_values = 100;
-    // Use small values to keep products in-range (field mod 2^61 - 1)
     let values: Vec<Fp> = (0..num_values).map(|i| Fp::new((i % 7 + 2) as u64)).collect();
     let expected: Fp = values.iter().copied().reduce(|a, b| a * b).unwrap();
 
@@ -915,9 +879,6 @@ async fn test_mass_chained_offline_multiply_with_reveal_100() {
     eprintln!("=== PASSED: 100-value chained offline multiply+reveal = {} ===", result);
 }
 
-/// Test the complete end-to-end protocol with intermediate reveals.
-/// After each multiplication step, all parties send their current shares
-/// to party 0, which reconstructs and logs the intermediate product.
 #[tokio::test]
 async fn test_chained_multiply_with_intermediate_reveals() {
     let values = vec![Fp::new(2), Fp::new(3), Fp::new(5), Fp::new(7), Fp::new(11)];
@@ -938,7 +899,6 @@ async fn test_chained_multiply_with_intermediate_reveals() {
             let shamir_t = Shamir::new(N, T).unwrap();
             let shamir_2t = Shamir::new(N, 2 * T).unwrap();
 
-            // Offline: generate double-shares
             let ot_randoms = run_silent_ot_setup(&mut bnet, party_id, &mut rng).await;
             let mut my_contribs: Vec<(Vec<Share>, Vec<Share>)> = Vec::new();
             for k in 0..num_mults {
@@ -970,7 +930,6 @@ async fn test_chained_multiply_with_intermediate_reveals() {
                 });
             }
 
-            // Online: share inputs
             let mut my_input_shares: Vec<Share> = Vec::with_capacity(num_values);
             if party_id == 0 {
                 for (v_idx, v) in vals.iter().enumerate() {
@@ -988,7 +947,6 @@ async fn test_chained_multiply_with_intermediate_reveals() {
                 }
             }
 
-            // Multiply and reveal at each step
             let mut current = my_input_shares[0];
             let mut intermediate_results: Vec<Fp> = Vec::new();
 
@@ -1023,7 +981,6 @@ async fn test_chained_multiply_with_intermediate_reveals() {
 
                 current = DnMultiply::compute_output_share(opened, ds);
 
-                // Intermediate reveal: send current share to party 0
                 let reveal_round = round + 2;
                 if party_id != 0 {
                     bnet.send(0, phase, reveal_round, &current).await.unwrap();

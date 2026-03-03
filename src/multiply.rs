@@ -57,11 +57,6 @@ impl DnMultiply {
         }
     }
 
-    /// Verify the king's opened value by independently reconstructing from
-    /// a subset of masked shares. In the honest-majority model (n > 2t),
-    /// at most t parties are corrupt, so any 2t+1 shares suffice for
-    /// correct reconstruction. If two independent subsets reconstruct to
-    /// different values, a malicious party is detected.
     pub fn verify_king_broadcast(
         &self,
         masked_shares: &[Share],
@@ -86,13 +81,6 @@ impl DnMultiply {
         Ok(())
     }
 
-    /// Simulate the full DN multiplication protocol locally with all parties' shares.
-    ///
-    /// **WARNING**: This is a simulation-only function for testing. It gives the caller
-    /// access to ALL parties' shares simultaneously, which would break privacy in a real
-    /// distributed setting. In production, use the individual steps
-    /// (`compute_masked_share`, `king_reconstruct`, `verify_king_broadcast`,
-    /// `compute_output_share`) with real network communication between parties.
     pub fn multiply_local(
         &self,
         x_shares: &[Share],
@@ -330,7 +318,6 @@ mod tests {
         let dn = DnMultiply::new(n, t, 0).unwrap();
         let opened = dn.king_reconstruct(&masked_shares).unwrap();
 
-        // Honest king: verification should pass
         dn.verify_king_broadcast(&masked_shares, opened).unwrap();
     }
 
@@ -357,7 +344,6 @@ mod tests {
         let dn = DnMultiply::new(n, t, 0).unwrap();
         let opened = dn.king_reconstruct(&masked_shares).unwrap();
 
-        // Malicious king: broadcast wrong value
         let wrong_value = opened + Fp::new(1);
         let result = dn.verify_king_broadcast(&masked_shares, wrong_value);
         assert!(result.is_err());

@@ -39,14 +39,6 @@ impl Block {
         Fp::new(u64::from_le_bytes(bytes))
     }
 
-    /// Compute a binding commitment to this block.
-    ///
-    /// Security: This scheme is H(domain || block) where block is a 128-bit
-    /// random seed. It is **binding** via SHA-256 collision resistance and
-    /// **hiding** because the 128-bit seed has full entropy — brute-forcing
-    /// all 2^128 candidates against the hash is computationally infeasible.
-    /// No additional nonce is needed when the committed value itself is
-    /// uniformly random, which is guaranteed by `Block::random()`.
     pub fn commit(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(b"SilentOT-commit:");
@@ -228,8 +220,6 @@ impl SilentOtParams {
                 n, t
             )));
         }
-        // Use integer arithmetic for tree_depth to avoid floating-point imprecision.
-        // Computes ceil(log2(num_ots)), minimum 1.
         let tree_depth = if num_ots <= 1 {
             1
         } else {
@@ -489,8 +479,6 @@ impl DistributedSilentOt {
         Ok(())
     }
 
-    /// Validate that the party state is complete after all 4 rounds.
-    /// Detects if any party silently dropped out (failed to send expected messages).
     pub fn validate_state(state: &PartySetupState) -> Result<()> {
         for j in 0..state.n {
             if j == state.party_id {
@@ -561,9 +549,6 @@ impl DistributedSilentOt {
             }
         }
 
-        // Store puncture indices so get_random can skip corrupted positions.
-        // my_puncture_indices[j] = the puncture index this party chose for pair (j, self),
-        // i.e. receiver_values[j][puncture_idx] is NOT a valid GGM leaf.
         let mut puncture_indices: Vec<Option<usize>> = vec![None; n];
         for j in 0..n {
             if j == state.party_id {
@@ -586,16 +571,10 @@ pub struct ExpandedCorrelations {
     pub party_id: usize,
     pub sender_values: Vec<Vec<Fp>>,
     pub receiver_values: Vec<Vec<Fp>>,
-    /// For each peer j, the puncture index chosen by this party for the (j, self) pair.
-    /// receiver_values[j][puncture_indices[j]] is NOT a valid GGM leaf value
-    /// and must be skipped when computing correlated randomness.
     pub puncture_indices: Vec<Option<usize>>,
 }
 
 impl ExpandedCorrelations {
-    /// Derive a pseudorandom field element from the OT correlations at the given index.
-    /// Sums sender and receiver values across all pairs, skipping receiver values
-    /// at punctured indices (where the reconstructed GGM leaf is invalid).
     pub fn get_random(&self, index: usize) -> Fp {
         let mut sum = Fp::ZERO;
         for j in 0..self.sender_values.len() {
@@ -606,9 +585,6 @@ impl ExpandedCorrelations {
                 sum += self.sender_values[j][index];
             }
             if index < self.receiver_values[j].len() {
-                // Skip receiver values at the punctured index: the reconstructed
-                // GGM tree has Block::ZERO there (not the real leaf), so hashing it
-                // would produce a deterministic non-random field element.
                 let is_punctured = self.puncture_indices[j]
                     .map_or(false, |p| p == index);
                 if !is_punctured {
@@ -782,7 +758,6 @@ mod tests {
         let protocol = DistributedSilentOt::new(params);
         let state = protocol.init_party(0, &mut rng);
 
-        // State after init but before receiving any messages should fail validation
         let result = DistributedSilentOt::validate_state(&state);
         assert!(result.is_err());
         assert!(format!("{}", result.unwrap_err()).contains("missing commitment"));
@@ -822,7 +797,6 @@ mod tests {
             DistributedSilentOt::process_round2(state, &all_r2_msgs).unwrap();
         }
 
-        // After rounds 0-2, all states should be valid
         for state in &states {
             DistributedSilentOt::validate_state(state).unwrap();
         }
