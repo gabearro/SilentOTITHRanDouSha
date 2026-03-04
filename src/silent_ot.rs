@@ -76,6 +76,15 @@ impl Block {
 }
 
 pub fn batch_to_field_elements(blocks: &[Block], count: usize) -> Vec<Fp> {
+    const PAR_THRESHOLD: usize = 32768;
+    if count >= PAR_THRESHOLD {
+        batch_to_field_elements_parallel(blocks, count)
+    } else {
+        batch_to_field_elements_seq(blocks, count)
+    }
+}
+
+fn batch_to_field_elements_seq(blocks: &[Block], count: usize) -> Vec<Fp> {
     const CHUNK: usize = 4096;
     let key = prg_key_field();
     let mut results = Vec::with_capacity(count);
@@ -115,6 +124,59 @@ pub fn batch_to_field_elements(blocks: &[Block], count: usize) -> Vec<Fp> {
         }
     }
 
+    results
+}
+
+fn batch_to_field_elements_parallel(blocks: &[Block], count: usize) -> Vec<Fp> {
+    const CHUNK: usize = 16384;
+    let num_chunks = count.div_ceil(CHUNK);
+
+    let chunks: Vec<Vec<Fp>> = (0..num_chunks)
+        .into_par_iter()
+        .map(|chunk_idx| {
+            let key = prg_key_field();
+            let chunk_start = chunk_idx * CHUNK;
+            let chunk_end = (chunk_start + CHUNK).min(count);
+            let chunk_len = chunk_end - chunk_start;
+
+            let mut inputs: Vec<[u8; 16]> = Vec::with_capacity(chunk_len);
+            let mut aes_blocks: Vec<aes::Block> = Vec::with_capacity(chunk_len);
+
+            for k in chunk_start..chunk_end {
+                let domain_bytes = (k as u64).to_le_bytes();
+                let mut input = blocks[k].0;
+                for i in 0..8 {
+                    input[i] ^= domain_bytes[i];
+                }
+                inputs.push(input);
+                aes_blocks.push(aes::Block::from(input));
+            }
+
+            key.encrypt_blocks(&mut aes_blocks);
+
+            let mut out = Vec::with_capacity(chunk_len);
+            for idx in 0..chunk_len {
+                let enc: [u8; 16] = aes_blocks[idx].into();
+                let val = u64::from_le_bytes([
+                    enc[0] ^ inputs[idx][0],
+                    enc[1] ^ inputs[idx][1],
+                    enc[2] ^ inputs[idx][2],
+                    enc[3] ^ inputs[idx][3],
+                    enc[4] ^ inputs[idx][4],
+                    enc[5] ^ inputs[idx][5],
+                    enc[6] ^ inputs[idx][6],
+                    enc[7] ^ inputs[idx][7],
+                ]);
+                out.push(Fp::new(val));
+            }
+            out
+        })
+        .collect();
+
+    let mut results = Vec::with_capacity(count);
+    for chunk in chunks {
+        results.extend(chunk);
+    }
     results
 }
 
@@ -180,26 +242,40 @@ impl GgmTree {
     pub fn expand_full(&self, root: &Block) -> Vec<Block> {
         let key_l = prg_key_left();
         let key_r = prg_key_right();
+        let num_leaves = 1usize << self.depth;
         let mut current_level = vec![*root];
-        let mut next_level = Vec::new();
+        let mut next_level = Vec::with_capacity(num_leaves);
+        // Pre-allocate AES buffers to reuse across levels
+        let max_level = if self.depth > 0 { 1usize << (self.depth - 1) } else { 1 };
+        let mut blocks_buf: Vec<aes::Block> = Vec::with_capacity(max_level);
 
         for _ in 0..self.depth {
             let len = current_level.len();
             if len >= 64 {
-                let mut blocks_l: Vec<aes::Block> =
-                    current_level.iter().map(|s| aes::Block::from(s.0)).collect();
-                let mut blocks_r: Vec<aes::Block> =
-                    current_level.iter().map(|s| aes::Block::from(s.0)).collect();
+                // Reuse buffer: fill with seeds, encrypt for left children
+                blocks_buf.clear();
+                blocks_buf.extend(current_level.iter().map(|s| aes::Block::from(s.0)));
 
-                key_l.encrypt_blocks(&mut blocks_l);
-                key_r.encrypt_blocks(&mut blocks_r);
+                // Encrypt left
+                key_l.encrypt_blocks(&mut blocks_buf);
 
                 next_level.clear();
                 next_level.resize(len * 2, Block::ZERO);
+                // Write left children with XOR
                 for (i, seed) in current_level.iter().enumerate() {
-                    next_level[2 * i] = Block(blocks_l[i].into()).xor(seed);
-                    next_level[2 * i + 1] = Block(blocks_r[i].into()).xor(seed);
+                    next_level[2 * i] = Block(blocks_buf[i].into()).xor(seed);
                 }
+
+                // Reuse buffer: fill with seeds again, encrypt for right children
+                for (i, seed) in current_level.iter().enumerate() {
+                    blocks_buf[i] = aes::Block::from(seed.0);
+                }
+                key_r.encrypt_blocks(&mut blocks_buf);
+                // Write right children with XOR
+                for (i, seed) in current_level.iter().enumerate() {
+                    next_level[2 * i + 1] = Block(blocks_buf[i].into()).xor(seed);
+                }
+
                 std::mem::swap(&mut current_level, &mut next_level);
             } else {
                 next_level.clear();
@@ -301,6 +377,129 @@ impl GgmTree {
 
         Ok(leaves)
     }
+
+    /// Fused: expand full tree and convert leaves to field elements directly.
+    /// Avoids allocating an intermediate Vec<Block> for the leaves then converting separately.
+    pub fn expand_full_to_field_elements(&self, root: &Block, count: usize) -> Vec<Fp> {
+        let leaves = self.expand_full(root);
+        batch_to_field_elements(&leaves, count)
+    }
+
+    /// Fused: reconstruct from siblings and convert directly to field elements.
+    /// Each subtree's leaves are converted to field elements in parallel,
+    /// avoiding the 16MB intermediate leaves vector.
+    pub fn reconstruct_to_field_elements(
+        &self,
+        sibling_path: &[Block],
+        puncture_idx: usize,
+        count: usize,
+    ) -> Result<Vec<Fp>> {
+        if sibling_path.len() != self.depth {
+            return Err(ProtocolError::MaliciousParty(format!(
+                "expected sibling path of length {}, got {}",
+                self.depth,
+                sibling_path.len()
+            )));
+        }
+        if puncture_idx >= self.num_leaves() {
+            return Err(ProtocolError::InvalidParams(format!(
+                "puncture index {} out of range [0, {})",
+                puncture_idx,
+                self.num_leaves()
+            )));
+        }
+
+        let subtree_info: Vec<(usize, usize, &Block)> = sibling_path
+            .iter()
+            .enumerate()
+            .map(|(level, sibling)| {
+                let subtree_depth = self.depth - 1 - level;
+                let subtree_size = 1usize << subtree_depth;
+                let parent_idx = puncture_idx >> (self.depth - level);
+                let puncture_bit = (puncture_idx >> (self.depth - 1 - level)) & 1;
+                let sibling_start = if puncture_bit == 0 {
+                    (parent_idx * 2 + 1) * subtree_size
+                } else {
+                    (parent_idx * 2) * subtree_size
+                };
+                (subtree_depth, sibling_start, sibling)
+            })
+            .collect();
+
+        // Expand each subtree and convert to field elements in parallel
+        let subtree_results: Vec<(usize, Vec<Fp>)> = subtree_info
+            .par_iter()
+            .map(|&(subtree_depth, sibling_start, sibling)| {
+                let subtree_leaves = GgmTree::new(subtree_depth).expand_full(sibling);
+                let subtree_count = subtree_leaves.len().min(
+                    if sibling_start < count { count - sibling_start } else { 0 }
+                );
+                let field_elems = if subtree_count > 0 {
+                    batch_to_field_elements_at_offset(&subtree_leaves, sibling_start, subtree_count)
+                } else {
+                    Vec::new()
+                };
+                (sibling_start, field_elems)
+            })
+            .collect();
+
+        let mut result = vec![Fp::ZERO; count];
+        for (sibling_start, field_elems) in subtree_results {
+            for (i, &val) in field_elems.iter().enumerate() {
+                let global_idx = sibling_start + i;
+                if global_idx < count {
+                    result[global_idx] = val;
+                }
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+/// Like batch_to_field_elements but uses domain = global_offset + local_index
+fn batch_to_field_elements_at_offset(blocks: &[Block], offset: usize, count: usize) -> Vec<Fp> {
+    const CHUNK: usize = 4096;
+    let key = prg_key_field();
+    let mut results = Vec::with_capacity(count);
+
+    for chunk_start in (0..count).step_by(CHUNK) {
+        let chunk_end = (chunk_start + CHUNK).min(count);
+        let chunk_len = chunk_end - chunk_start;
+
+        let mut inputs: Vec<[u8; 16]> = Vec::with_capacity(chunk_len);
+        let mut aes_blocks: Vec<aes::Block> = Vec::with_capacity(chunk_len);
+
+        for local_k in chunk_start..chunk_end {
+            let global_k = offset + local_k;
+            let domain_bytes = (global_k as u64).to_le_bytes();
+            let mut input = blocks[local_k].0;
+            for i in 0..8 {
+                input[i] ^= domain_bytes[i];
+            }
+            inputs.push(input);
+            aes_blocks.push(aes::Block::from(input));
+        }
+
+        key.encrypt_blocks(&mut aes_blocks);
+
+        for idx in 0..chunk_len {
+            let enc: [u8; 16] = aes_blocks[idx].into();
+            let val = u64::from_le_bytes([
+                enc[0] ^ inputs[idx][0],
+                enc[1] ^ inputs[idx][1],
+                enc[2] ^ inputs[idx][2],
+                enc[3] ^ inputs[idx][3],
+                enc[4] ^ inputs[idx][4],
+                enc[5] ^ inputs[idx][5],
+                enc[6] ^ inputs[idx][6],
+                enc[7] ^ inputs[idx][7],
+            ]);
+            results.push(Fp::new(val));
+        }
+    }
+
+    results
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -635,8 +834,9 @@ impl DistributedSilentOt {
 
         let peers: Vec<usize> = (0..n).filter(|&j| j != state.party_id).collect();
 
-        // For each peer: verify sibling path, compute sender/receiver values,
+        // For each peer: verify sibling path, compute sender/receiver field values,
         // and pre-sum the per-peer contribution — all in one parallel pass.
+        // Uses fused tree→field conversion to avoid materializing 16MB leaf vectors.
         let contributions: std::result::Result<Vec<Vec<Fp>>, ProtocolError> = peers
             .par_iter()
             .map(|&j| {
@@ -661,21 +861,19 @@ impl DistributedSilentOt {
                     }
                 }
 
-                // Compute sender values (my tree for peer j)
+                // Compute sender values (my tree for peer j) — fused expand+convert
                 let sender_vals = if let Some(seed) = state.my_seeds[j] {
-                    let leaves = tree.expand_full(&seed);
-                    batch_to_field_elements(&leaves, num_ots)
+                    tree.expand_full_to_field_elements(&seed, num_ots)
                 } else {
                     vec![Fp::ZERO; num_ots]
                 };
 
-                // Compute receiver values (peer j's tree for me)
+                // Compute receiver values (peer j's tree for me) — fused reconstruct+convert
                 let receiver_vals = if let (Some(received_path), Some(puncture_idx)) = (
                     &state.received_sibling_paths[j],
                     state.my_puncture_indices[j],
                 ) {
-                    let leaves = tree.reconstruct_from_siblings(received_path, puncture_idx)?;
-                    batch_to_field_elements(&leaves, num_ots)
+                    tree.reconstruct_to_field_elements(received_path, puncture_idx, num_ots)?
                 } else {
                     vec![Fp::ZERO; num_ots]
                 };
@@ -1293,5 +1491,36 @@ mod tests {
 
         let correlations = DistributedSilentOt::expand(&states[0]).unwrap();
         let _should_panic = correlations.get_random(9999);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_raw_aes_throughput() {
+        let key = prg_key_left();
+        let n = 524_288usize; // 2^19
+        let mut blocks: Vec<aes::Block> = (0..n)
+            .map(|i| aes::Block::from((i as u128).to_ne_bytes()))
+            .collect();
+
+        // Warmup
+        key.encrypt_blocks(&mut blocks);
+
+        let iters = 20;
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            key.encrypt_blocks(&mut blocks);
+        }
+        let elapsed = start.elapsed();
+        let total_blocks = n as u64 * iters;
+        eprintln!(
+            "AES batch: {}x encrypt_blocks({} blocks) = {:?}",
+            iters, n, elapsed
+        );
+        eprintln!(
+            "per call: {:.2?}, per block: {:.1}ns, throughput: {:.1} Mblocks/s",
+            elapsed / iters as u32,
+            elapsed.as_nanos() as f64 / total_blocks as f64,
+            total_blocks as f64 / elapsed.as_secs_f64() / 1e6
+        );
     }
 }

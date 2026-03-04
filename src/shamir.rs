@@ -49,6 +49,26 @@ impl Shamir {
             .collect()
     }
 
+    /// Write shares into a pre-allocated output slice, avoiding allocation.
+    /// `out` must have length >= self.n.
+    #[inline]
+    pub fn share_into<R: Rng>(&self, secret: Fp, rng: &mut R, out: &mut [Share]) {
+        debug_assert!(out.len() >= self.n);
+        // Use stack array for coefficients (degree is small, typically <= 2)
+        let mut coeffs = [Fp::ZERO; 8]; // supports up to degree 7
+        coeffs[0] = secret;
+        for i in 1..=self.degree {
+            coeffs[i] = Fp::random(rng);
+        }
+        let coeffs = &coeffs[..self.degree + 1];
+        for (idx, &point) in self.eval_points.iter().enumerate() {
+            out[idx] = Share {
+                point,
+                value: eval_poly(coeffs, point),
+            };
+        }
+    }
+
     pub fn share_with_poly(&self, coeffs: &[Fp]) -> Result<Vec<Share>> {
         if coeffs.len() != self.degree + 1 {
             return Err(ProtocolError::InvalidParams(format!(

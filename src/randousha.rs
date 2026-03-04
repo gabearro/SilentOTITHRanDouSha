@@ -629,37 +629,59 @@ mod tests {
             .collect();
         let eval_points_t: Vec<Fp> = shamir_t.eval_points.clone();
         let eval_points_2t: Vec<Fp> = shamir_2t.eval_points.clone();
+        let eval_pt2_sq: Vec<Fp> = eval_points_2t.iter().map(|&p| p * p).collect();
 
         let round_seeds: Vec<u64> = (0..num_rounds).map(|_| rng.gen()).collect();
 
-        let round_results: Vec<Vec<(Share, Share)>> = (0..num_rounds)
+        // Process rounds in parallel, batched to reduce rayon dispatch overhead.
+        // Each batch processes BATCH_SIZE rounds, each producing 15 (Share,Share) pairs.
+        const BATCH_SIZE: usize = 256;
+        let num_batches = num_rounds.div_ceil(BATCH_SIZE);
+        let entries_per_round = sharings_per_round * n;
+        let batch_results: Vec<Vec<(Share, Share)>> = (0..num_batches)
             .into_par_iter()
-            .map(|round| {
-                let mut local_rng = ChaCha20Rng::seed_from_u64(round_seeds[round]);
-                let secrets: Vec<Fp> = (0..n)
-                    .map(|i| ot_correlations[i].get_random(round))
-                    .collect();
+            .map(|batch_idx| {
+                let batch_start = batch_idx * BATCH_SIZE;
+                let batch_end = (batch_start + BATCH_SIZE).min(num_rounds);
+                let batch_len = batch_end - batch_start;
+                let mut out = Vec::with_capacity(batch_len * entries_per_round);
 
-                let mut all_shares_t: Vec<Vec<Share>> = Vec::with_capacity(n);
-                let mut all_shares_2t: Vec<Vec<Share>> = Vec::with_capacity(n);
-                for i in 0..n {
-                    all_shares_t.push(shamir_t.share(secrets[i], &mut local_rng));
-                    all_shares_2t.push(shamir_2t.share(secrets[i], &mut local_rng));
-                }
+                let mut local_rng = ChaCha20Rng::seed_from_u64(round_seeds[batch_start]);
 
-                let mut out = Vec::with_capacity(sharings_per_round * n);
-                for j in 0..sharings_per_round {
-                    for p in 0..n {
-                        let val_t: Fp = (0..n)
-                            .map(|i| him_rows_flat[j][i] * all_shares_t[i][p].value)
-                            .sum();
-                        let val_2t: Fp = (0..n)
-                            .map(|i| him_rows_flat[j][i] * all_shares_2t[i][p].value)
-                            .sum();
-                        out.push((
-                            Share { point: eval_points_t[p], value: val_t },
-                            Share { point: eval_points_2t[p], value: val_2t },
-                        ));
+                for round in batch_start..batch_end {
+                    let secrets: [Fp; 5] = std::array::from_fn(|i| ot_correlations[i].get_random(round));
+
+                    // Generate random coefficients for all sharings
+                    // Degree-t (t=1): each secret has 1 random coeff
+                    let r1_t: [Fp; 5] = std::array::from_fn(|_| Fp::random(&mut local_rng));
+                    // Degree-2t (2t=2): each secret has 2 random coeffs
+                    let r1_2t: [Fp; 5] = std::array::from_fn(|_| Fp::random(&mut local_rng));
+                    let r2_2t: [Fp; 5] = std::array::from_fn(|_| Fp::random(&mut local_rng));
+
+                    // Fused HIM × polynomial evaluation:
+                    // For degree-t: out[j][p] = A_j + eval_pt_p * B_j
+                    // For degree-2t: out[j][p] = A_j + eval_pt_p*B1_j + eval_pt_p²*B2_j
+                    // Note: a_t == a_2t since both use same secrets, so compute once
+                    for j in 0..sharings_per_round {
+                        let mut a = Fp::ZERO;
+                        let mut b_t = Fp::ZERO;
+                        let mut b1_2t = Fp::ZERO;
+                        let mut b2_2t = Fp::ZERO;
+                        for i in 0..n {
+                            let m = him_rows_flat[j][i];
+                            a += m * secrets[i];
+                            b_t += m * r1_t[i];
+                            b1_2t += m * r1_2t[i];
+                            b2_2t += m * r2_2t[i];
+                        }
+                        for p in 0..n {
+                            let val_t = a + eval_points_t[p] * b_t;
+                            let val_2t = a + eval_points_2t[p] * b1_2t + eval_pt2_sq[p] * b2_2t;
+                            out.push((
+                                Share { point: eval_points_t[p], value: val_t },
+                                Share { point: eval_points_2t[p], value: val_2t },
+                            ));
+                        }
                     }
                 }
                 out
@@ -669,10 +691,10 @@ mod tests {
         let mut all_party_shares: Vec<Vec<DoubleShare>> =
             (0..n).map(|_| Vec::with_capacity(num_mults)).collect();
 
-        for round_out in &round_results {
-            for chunk in round_out.chunks_exact(n) {
+        'outer: for batch_out in &batch_results {
+            for chunk in batch_out.chunks_exact(n) {
                 if all_party_shares[0].len() >= num_mults {
-                    break;
+                    break 'outer;
                 }
                 for p in 0..n {
                     all_party_shares[p].push(DoubleShare {
@@ -680,9 +702,6 @@ mod tests {
                         share_2t: chunk[p].1,
                     });
                 }
-            }
-            if all_party_shares[0].len() >= num_mults {
-                break;
             }
         }
 
