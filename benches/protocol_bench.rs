@@ -374,6 +374,235 @@ fn bench_fp_arithmetic(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_beaver_triple_gen(c: &mut Criterion) {
+    use silent_ot_randousha::beaver::generate_triples_from_party_indexed;
+
+    let mut group = c.benchmark_group("beaver_triple_gen");
+    group.sample_size(10);
+
+    let n = 5;
+    let t = 1;
+
+    for count in [1_000, 10_000, 100_000] {
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let params = RanDouShaParams::new(n, t, count).unwrap();
+        let party_ds = RanDouShaProtocol::new(params)
+            .generate_local(&mut rng)
+            .unwrap();
+
+        group.bench_with_input(
+            BenchmarkId::new("from_party_indexed", count),
+            &count,
+            |b, _| {
+                b.iter(|| {
+                    let mut rng = ChaCha20Rng::seed_from_u64(99);
+                    black_box(
+                        generate_triples_from_party_indexed(n, t, &party_ds, &mut rng)
+                            .unwrap(),
+                    )
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_beaver_e2e(c: &mut Criterion) {
+    use silent_ot_randousha::beaver::generate_triples_from_party_indexed;
+
+    let mut group = c.benchmark_group("beaver_e2e");
+    group.sample_size(10);
+
+    let n = 5;
+    let t = 1;
+
+    for count in [10_000, 100_000] {
+        group.bench_with_input(
+            BenchmarkId::new("ot_him_triples", count),
+            &count,
+            |b, &count| {
+                b.iter(|| {
+                    let mut rng = ChaCha20Rng::seed_from_u64(42);
+                    let params = RanDouShaParams::new(n, t, count).unwrap();
+                    let party_ds = RanDouShaProtocol::new(params)
+                        .generate_local(&mut rng)
+                        .unwrap();
+                    black_box(
+                        generate_triples_from_party_indexed(n, t, &party_ds, &mut rng)
+                            .unwrap(),
+                    )
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_beaver_fused(c: &mut Criterion) {
+    use silent_ot_randousha::beaver::generate_triples_from_ot;
+    use silent_ot_randousha::silent_ot::{DistributedSilentOt, SilentOtParams};
+
+    let mut group = c.benchmark_group("beaver_fused");
+    group.sample_size(10);
+
+    let n = 5;
+    let t = 1;
+
+    for count in [10_000, 100_000] {
+        let sharings_per_round = n - 2 * t;
+        let num_rounds = count / sharings_per_round + 1;
+
+        // Pre-setup OT correlations (only benchmark the fused HIM+triple phase)
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let ot_params = SilentOtParams::new(n, t, num_rounds).unwrap();
+        let ot_protocol = DistributedSilentOt::new(ot_params);
+        let mut ot_states: Vec<_> =
+            (0..n).map(|i| ot_protocol.init_party(i, &mut rng)).collect();
+
+        let mut r0 = vec![Vec::new(); n];
+        for s in ot_states.iter() {
+            for (to, cm) in DistributedSilentOt::round0_commitments(s) {
+                r0[to].push((s.party_id, cm));
+            }
+        }
+        for (i, s) in ot_states.iter_mut().enumerate() {
+            DistributedSilentOt::process_round0(s, &r0[i]).unwrap();
+        }
+        let mut r1 = vec![Vec::new(); n];
+        for s in ot_states.iter() {
+            for (to, idx) in DistributedSilentOt::round1_puncture_choices(s) {
+                r1[to].push((s.party_id, idx));
+            }
+        }
+        for (i, s) in ot_states.iter_mut().enumerate() {
+            DistributedSilentOt::process_round1(s, &r1[i]).unwrap();
+        }
+        let mut r2 = vec![Vec::new(); n];
+        for s in ot_states.iter() {
+            for (to, path) in DistributedSilentOt::round2_sibling_paths(s).unwrap() {
+                r2[to].push((s.party_id, path));
+            }
+        }
+        for (i, s) in ot_states.iter_mut().enumerate() {
+            DistributedSilentOt::process_round2(s, &r2[i]).unwrap();
+        }
+        let mut r3 = vec![Vec::new(); n];
+        for s in ot_states.iter() {
+            for (to, seed) in DistributedSilentOt::round3_seed_reveals(s) {
+                r3[to].push((s.party_id, seed));
+            }
+        }
+        for (i, s) in ot_states.iter_mut().enumerate() {
+            DistributedSilentOt::process_round3(s, &r3[i]).unwrap();
+        }
+
+        let ot_correlations: Vec<_> = ot_states
+            .par_iter()
+            .map(|s| DistributedSilentOt::expand(s).unwrap())
+            .collect();
+
+        group.bench_with_input(
+            BenchmarkId::new("fused_him_triples", count),
+            &count,
+            |b, &count| {
+                b.iter(|| {
+                    let mut rng = ChaCha20Rng::seed_from_u64(99);
+                    black_box(
+                        generate_triples_from_ot(n, t, count, &ot_correlations, &mut rng)
+                            .unwrap(),
+                    )
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_beaver_fused_batch(c: &mut Criterion) {
+    use silent_ot_randousha::beaver::generate_triples_from_ot_batch;
+    use silent_ot_randousha::silent_ot::{DistributedSilentOt, SilentOtParams};
+
+    // Batch API with round-2 optimizations: direct partitioned writes (no scatter),
+    // batch RNG, CHUNK=16384, u64-native expand path.
+    let mut group = c.benchmark_group("beaver_fused_batch");
+    group.sample_size(10);
+
+    let n = 5;
+    let t = 1;
+
+    for count in [10_000, 100_000] {
+        let sharings_per_round = n - 2 * t;
+        let num_rounds = count / sharings_per_round + 1;
+
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let ot_params = SilentOtParams::new(n, t, num_rounds).unwrap();
+        let ot_protocol = DistributedSilentOt::new(ot_params);
+        let mut ot_states: Vec<_> =
+            (0..n).map(|i| ot_protocol.init_party(i, &mut rng)).collect();
+
+        let mut r0 = vec![Vec::new(); n];
+        for s in ot_states.iter() {
+            for (to, cm) in DistributedSilentOt::round0_commitments(s) {
+                r0[to].push((s.party_id, cm));
+            }
+        }
+        for (i, s) in ot_states.iter_mut().enumerate() {
+            DistributedSilentOt::process_round0(s, &r0[i]).unwrap();
+        }
+        let mut r1 = vec![Vec::new(); n];
+        for s in ot_states.iter() {
+            for (to, idx) in DistributedSilentOt::round1_puncture_choices(s) {
+                r1[to].push((s.party_id, idx));
+            }
+        }
+        for (i, s) in ot_states.iter_mut().enumerate() {
+            DistributedSilentOt::process_round1(s, &r1[i]).unwrap();
+        }
+        let mut r2 = vec![Vec::new(); n];
+        for s in ot_states.iter() {
+            for (to, path) in DistributedSilentOt::round2_sibling_paths(s).unwrap() {
+                r2[to].push((s.party_id, path));
+            }
+        }
+        for (i, s) in ot_states.iter_mut().enumerate() {
+            DistributedSilentOt::process_round2(s, &r2[i]).unwrap();
+        }
+        let mut r3 = vec![Vec::new(); n];
+        for s in ot_states.iter() {
+            for (to, seed) in DistributedSilentOt::round3_seed_reveals(s) {
+                r3[to].push((s.party_id, seed));
+            }
+        }
+        for (i, s) in ot_states.iter_mut().enumerate() {
+            DistributedSilentOt::process_round3(s, &r3[i]).unwrap();
+        }
+
+        let ot_correlations: Vec<_> = ot_states
+            .par_iter()
+            .map(|s| DistributedSilentOt::expand(s).unwrap())
+            .collect();
+
+        group.bench_with_input(
+            BenchmarkId::new("fused_him_triples_batch", count),
+            &count,
+            |b, &count| {
+                b.iter(|| {
+                    let mut rng = ChaCha20Rng::seed_from_u64(99);
+                    black_box(
+                        generate_triples_from_ot_batch(n, t, count, &ot_correlations, &mut rng)
+                            .unwrap(),
+                    )
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_fp_arithmetic,
@@ -387,5 +616,9 @@ criterion_group!(
     bench_multiply_sequence,
     bench_silent_ot_expand_only,
     bench_silent_ot_full,
+    bench_beaver_triple_gen,
+    bench_beaver_e2e,
+    bench_beaver_fused,
+    bench_beaver_fused_batch,
 );
 criterion_main!(benches);

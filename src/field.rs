@@ -29,8 +29,41 @@ impl Fp {
         self.0
     }
 
+    /// Return the inner u64 value (already reduced mod p).
     #[inline]
-    fn reduce(x: u64) -> u64 {
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// Construct from a value that is *already* reduced (i.e. < PRIME).
+    /// No reduction is performed — caller must guarantee `v < PRIME`.
+    #[inline]
+    pub fn from_reduced(v: u64) -> Self {
+        debug_assert!(v < PRIME, "from_reduced: value {} >= PRIME", v);
+        Fp(v)
+    }
+
+    /// Multiply two already-reduced u64 values mod p, returning a reduced u64.
+    #[inline]
+    pub fn mul_raw(a: u64, b: u64) -> u64 {
+        Self::reduce_wide((a as u128) * (b as u128))
+    }
+
+    /// Add two already-reduced u64 values mod p, returning a reduced u64.
+    #[inline]
+    pub fn add_raw(a: u64, b: u64) -> u64 {
+        let r = a + b;
+        if r >= PRIME { r - PRIME } else { r }
+    }
+
+    /// Subtract two already-reduced u64 values mod p, returning a reduced u64.
+    #[inline]
+    pub fn sub_raw(a: u64, b: u64) -> u64 {
+        if a >= b { a - b } else { PRIME - b + a }
+    }
+
+    #[inline]
+    pub fn reduce(x: u64) -> u64 {
         let mut r = (x >> 61) + (x & PRIME);
         if r >= PRIME {
             r -= PRIME;
@@ -38,8 +71,9 @@ impl Fp {
         r
     }
 
+    /// Reduce a wide 128-bit product mod p = 2^61 - 1.
     #[inline]
-    fn reduce_wide(x: u128) -> u64 {
+    pub fn reduce_wide(x: u128) -> u64 {
         let lo = (x & (PRIME as u128)) as u64;
         let mid = ((x >> 61) & (PRIME as u128)) as u64;
         let hi = (x >> 122) as u64;
@@ -82,6 +116,21 @@ impl Fp {
             let v: u64 = rng.gen::<u64>() >> 3;
             if v < PRIME {
                 return Fp(v);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn random_batch_raw<R: Rng>(rng: &mut R, out: &mut [u64]) {
+        let byte_len = out.len() * 8;
+        let byte_slice = unsafe {
+            std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, byte_len)
+        };
+        rng.fill_bytes(byte_slice);
+        for v in out.iter_mut() {
+            *v >>= 3;
+            if *v >= PRIME {
+                *v -= PRIME;
             }
         }
     }

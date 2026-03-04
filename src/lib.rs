@@ -1,5 +1,6 @@
 #![allow(clippy::needless_range_loop, clippy::type_complexity)]
 
+pub mod beaver;
 pub mod error;
 pub mod field;
 pub mod multiply;
