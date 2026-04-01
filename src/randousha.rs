@@ -27,9 +27,7 @@ impl RanDouShaParams {
             )));
         }
         if count == 0 {
-            return Err(ProtocolError::InvalidParams(
-                "count must be > 0".into(),
-            ));
+            return Err(ProtocolError::InvalidParams("count must be > 0".into()));
         }
         Ok(RanDouShaParams { n, t, count })
     }
@@ -61,11 +59,7 @@ impl HyperInvertibleMatrix {
     pub fn mul_vec(&self, v: &[Fp]) -> Vec<Fp> {
         assert_eq!(v.len(), self.n);
         (0..self.n)
-            .map(|i| {
-                (0..self.n)
-                    .map(|j| self.entries[i][j] * v[j])
-                    .sum()
-            })
+            .map(|i| (0..self.n).map(|j| self.entries[i][j] * v[j]).sum())
             .collect()
     }
 }
@@ -88,50 +82,34 @@ impl RanDouShaProtocol {
         let shamir_t = Shamir::new(n, t)?;
         let shamir_2t = Shamir::new(n, 2 * t)?;
 
-        let ot_params = SilentOtParams::new(n, t, std::cmp::max(count * 2, 16))?;
+        // Only need num_rounds OT values, not count*2 (was 6x over-allocated for n=5,t=1)
+        let sharings_per_round = n - 2 * t;
+        let num_rounds = count.div_ceil(sharings_per_round);
+        let ot_params = SilentOtParams::with_arity(n, t, std::cmp::max(num_rounds, 16), 4)?;
         let protocol = DistributedSilentOt::new(ot_params);
 
         let mut ot_states: Vec<_> = (0..n).map(|i| protocol.init_party(i, rng)).collect();
 
-        // Pre-bucket messages by recipient for O(n²) dispatch instead of O(n³) scanning
-        let mut r0 = vec![Vec::new(); n];
+        // 2-round protocol: Round A (commitments + puncture choices)
+        let mut ra = vec![Vec::new(); n];
         for s in ot_states.iter() {
-            for (to, c) in DistributedSilentOt::round0_commitments(s) {
-                r0[to].push((s.party_id, c));
+            for (to, commitment, punct_idx) in DistributedSilentOt::round_a_messages(s) {
+                ra[to].push((s.party_id, commitment, punct_idx));
             }
         }
         for (i, s) in ot_states.iter_mut().enumerate() {
-            DistributedSilentOt::process_round0(s, &r0[i])?;
+            DistributedSilentOt::process_round_a(s, &ra[i])?;
         }
 
-        let mut r1 = vec![Vec::new(); n];
+        // 2-round protocol: Round B (sibling paths + seed reveals)
+        let mut rb = vec![Vec::new(); n];
         for s in ot_states.iter() {
-            for (to, idx) in DistributedSilentOt::round1_puncture_choices(s) {
-                r1[to].push((s.party_id, idx));
+            for (to, path, seed) in DistributedSilentOt::round_b_messages(s)? {
+                rb[to].push((s.party_id, path, seed));
             }
         }
         for (i, s) in ot_states.iter_mut().enumerate() {
-            DistributedSilentOt::process_round1(s, &r1[i])?;
-        }
-
-        let mut r2 = vec![Vec::new(); n];
-        for s in ot_states.iter() {
-            for (to, path) in DistributedSilentOt::round2_sibling_paths(s)? {
-                r2[to].push((s.party_id, path));
-            }
-        }
-        for (i, s) in ot_states.iter_mut().enumerate() {
-            DistributedSilentOt::process_round2(s, &r2[i])?;
-        }
-
-        let mut r3 = vec![Vec::new(); n];
-        for s in ot_states.iter() {
-            for (to, seed) in DistributedSilentOt::round3_seed_reveals(s) {
-                r3[to].push((s.party_id, seed));
-            }
-        }
-        for (i, s) in ot_states.iter_mut().enumerate() {
-            DistributedSilentOt::process_round3(s, &r3[i])?;
+            DistributedSilentOt::process_round_b(s, &rb[i])?;
         }
 
         let ot_correlations: Vec<ExpandedCorrelations> = ot_states
@@ -140,73 +118,139 @@ impl RanDouShaProtocol {
             .collect::<Result<_>>()?;
 
         let him = HyperInvertibleMatrix::new(n);
-        let sharings_per_round = n - 2 * t;
-        let num_rounds = count.div_ceil(sharings_per_round);
 
-        let him_rows: Vec<Vec<Fp>> = (0..n)
-            .map(|row| (0..n).map(|col| him.get(row, col)).collect())
+        // Pre-compute HIM rows as raw u64 for u128 lazy accumulation
+        let him_rows_raw: Vec<Vec<u64>> = (0..n)
+            .map(|row| (0..n).map(|col| him.get(row, col).raw()).collect())
             .collect();
+        let eval_points_t = &shamir_t.eval_points;
+        let eval_points_2t = &shamir_2t.eval_points;
+        let eval_2t_sq: Vec<Fp> = eval_points_2t.iter().map(|&x| x * x).collect();
         let lagrange_t = shamir_t.lagrange_coefficients();
         let lagrange_2t = shamir_2t.lagrange_coefficients();
 
-        let mut all_party_shares: Vec<Vec<DoubleShare>> = vec![Vec::new(); n];
+        // Pre-generate per-round RNG seeds for parallel processing
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+        let round_seeds: Vec<u64> = (0..num_rounds).map(|_| rng.gen()).collect();
 
-        for round in 0..num_rounds {
-            let secrets: Vec<Fp> = (0..n)
-                .map(|i| ot_correlations[i].get_random(round))
-                .collect();
+        // Process rounds in parallel, each producing sharings_per_round double shares
+        const BATCH: usize = 1024;
+        let num_batches = num_rounds.div_ceil(BATCH);
+        let batch_results: Vec<std::result::Result<Vec<Vec<DoubleShare>>, ProtocolError>> = (0..num_batches)
+            .into_par_iter()
+            .map(|batch_idx| {
+                let batch_start = batch_idx * BATCH;
+                let batch_end = (batch_start + BATCH).min(num_rounds);
+                let mut local_rng = ChaCha20Rng::seed_from_u64(round_seeds[batch_start]);
+                // Output: [sharing_index][party] within this batch
+                let capacity = (batch_end - batch_start) * sharings_per_round;
+                let mut batch_out: Vec<Vec<DoubleShare>> = Vec::with_capacity(capacity);
 
-            let mut all_shares_t: Vec<Vec<Share>> = Vec::with_capacity(n);
-            let mut all_shares_2t: Vec<Vec<Share>> = Vec::with_capacity(n);
+                for round in batch_start..batch_end {
+                    let secrets_raw: Vec<u64> = (0..n)
+                        .map(|i| ot_correlations[i].get_random(round).raw())
+                        .collect();
 
-            for i in 0..n {
-                all_shares_t.push(shamir_t.share(secrets[i], rng));
-                all_shares_2t.push(shamir_2t.share(secrets[i], rng));
-            }
+                    // Generate random coefficients inline (skip Shamir::share allocation)
+                    // degree-t: 1 random coeff per secret
+                    let r1_t: Vec<u64> = (0..n).map(|_| Fp::random(&mut local_rng).raw()).collect();
+                    // degree-2t: 2 random coeffs per secret
+                    let r1_2t: Vec<u64> = (0..n).map(|_| Fp::random(&mut local_rng).raw()).collect();
+                    let r2_2t: Vec<u64> = (0..n).map(|_| Fp::random(&mut local_rng).raw()).collect();
 
-            for j in 0..sharings_per_round {
+                    // Compute share values at each eval point using inline polynomial eval:
+                    // share_t[i][p] = secrets[i] + r1_t[i] * eval_pt[p]
+                    // share_2t[i][p] = secrets[i] + r1_2t[i] * eval_pt[p] + r2_2t[i] * eval_pt[p]^2
+                    // Then HIM mix: out[j][p] = sum_i him[j][i] * share[i][p]
+                    // Fused: out[j][p] = HIM[j] · secrets + eval_pt[p] * (HIM[j] · r1) + eval_pt[p]^2 * (HIM[j] · r2)
+
+                    for j in 0..sharings_per_round {
+                        // u128 lazy HIM dot products
+                        let mut a_acc: u128 = 0;
+                        let mut bt_acc: u128 = 0;
+                        let mut b1_acc: u128 = 0;
+                        let mut b2_acc: u128 = 0;
+                        for i in 0..n {
+                            let m = him_rows_raw[j][i] as u128;
+                            a_acc += m * (secrets_raw[i] as u128);
+                            bt_acc += m * (r1_t[i] as u128);
+                            b1_acc += m * (r1_2t[i] as u128);
+                            b2_acc += m * (r2_2t[i] as u128);
+                        }
+                        let a = Fp::from_reduced(Fp::reduce_wide(a_acc));
+                        let bt = Fp::from_reduced(Fp::reduce_wide(bt_acc));
+                        let b1 = Fp::from_reduced(Fp::reduce_wide(b1_acc));
+                        let b2 = Fp::from_reduced(Fp::reduce_wide(b2_acc));
+
+                        let mut party_ds = Vec::with_capacity(n);
+                        for p in 0..n {
+                            let val_t = a + eval_points_t[p] * bt;
+                            let val_2t = a + eval_points_2t[p] * b1
+                                + eval_2t_sq[p] * b2;
+                            party_ds.push(DoubleShare {
+                                share_t: Share { point: eval_points_t[p], value: val_t },
+                                share_2t: Share { point: eval_points_2t[p], value: val_2t },
+                            });
+                        }
+                        batch_out.push(party_ds);
+                    }
+
+                    // HIM check rows: verify degree-t and degree-2t secrets match
+                    for check_row in sharings_per_round..n {
+                        let mut a_acc: u128 = 0;
+                        let mut bt_acc: u128 = 0;
+                        let mut b1_acc: u128 = 0;
+                        let mut b2_acc: u128 = 0;
+                        for i in 0..n {
+                            let m = him_rows_raw[check_row][i] as u128;
+                            a_acc += m * (secrets_raw[i] as u128);
+                            bt_acc += m * (r1_t[i] as u128);
+                            b1_acc += m * (r1_2t[i] as u128);
+                            b2_acc += m * (r2_2t[i] as u128);
+                        }
+                        let a_check = Fp::from_reduced(Fp::reduce_wide(a_acc));
+                        let bt_check = Fp::from_reduced(Fp::reduce_wide(bt_acc));
+                        let b1_check = Fp::from_reduced(Fp::reduce_wide(b1_acc));
+                        let b2_check = Fp::from_reduced(Fp::reduce_wide(b2_acc));
+
+                        // Reconstruct degree-t secret: sum_p lagrange_t[p] * (a + eval_pt_p * bt)
+                        let mut secret_t_acc: u128 = 0;
+                        let mut secret_2t_acc: u128 = 0;
+                        for p in 0..n {
+                            let val_t = a_check + eval_points_t[p] * bt_check;
+                            let val_2t = a_check + eval_points_2t[p] * b1_check
+                                + eval_2t_sq[p] * b2_check;
+                            secret_t_acc += (lagrange_t[p].raw() as u128) * (val_t.raw() as u128);
+                            secret_2t_acc += (lagrange_2t[p].raw() as u128) * (val_2t.raw() as u128);
+                        }
+                        let secret_t = Fp::from_reduced(Fp::reduce_wide(secret_t_acc));
+                        let secret_2t = Fp::from_reduced(Fp::reduce_wide(secret_2t_acc));
+
+                        if secret_t != secret_2t {
+                            return Err(ProtocolError::MaliciousParty(format!(
+                                "HIM check row {} in round {} failed: degree-t secret={} != degree-2t secret={}",
+                                check_row, round, secret_t, secret_2t
+                            )));
+                        }
+                    }
+                }
+                Ok(batch_out)
+            })
+            .collect();
+
+        // Collect results in order, transpose from [sharing][party] to [party][sharing]
+        let mut all_party_shares: Vec<Vec<DoubleShare>> =
+            (0..n).map(|_| Vec::with_capacity(count)).collect();
+
+        for batch_result in batch_results {
+            let batch_out = batch_result?;
+            for party_ds in batch_out {
                 if all_party_shares[0].len() >= count {
                     break;
                 }
-
-                for p in 0..n {
-                    let val_t: Fp = (0..n)
-                        .map(|i| him_rows[j][i] * all_shares_t[i][p].value)
-                        .sum();
-                    let val_2t: Fp = (0..n)
-                        .map(|i| him_rows[j][i] * all_shares_2t[i][p].value)
-                        .sum();
-                    all_party_shares[p].push(DoubleShare {
-                        share_t: Share { point: shamir_t.eval_points[p], value: val_t },
-                        share_2t: Share { point: shamir_2t.eval_points[p], value: val_2t },
-                    });
-                }
-            }
-
-            for check_row in sharings_per_round..n {
-                let secret_t: Fp = (0..n)
-                    .map(|p| {
-                        let val: Fp = (0..n)
-                            .map(|i| him_rows[check_row][i] * all_shares_t[i][p].value)
-                            .sum();
-                        lagrange_t[p] * val
-                    })
-                    .sum();
-
-                let secret_2t: Fp = (0..n)
-                    .map(|p| {
-                        let val: Fp = (0..n)
-                            .map(|i| him_rows[check_row][i] * all_shares_2t[i][p].value)
-                            .sum();
-                        lagrange_2t[p] * val
-                    })
-                    .sum();
-
-                if secret_t != secret_2t {
-                    return Err(ProtocolError::MaliciousParty(format!(
-                        "HIM check row {} in round {} failed: degree-t secret={} != degree-2t secret={}",
-                        check_row, round, secret_t, secret_2t
-                    )));
+                for (p, ds) in party_ds.into_iter().enumerate() {
+                    all_party_shares[p].push(ds);
                 }
             }
         }
@@ -424,8 +468,9 @@ mod tests {
         let ot_start = std::time::Instant::now();
         let ot_params = SilentOtParams::new(n, t, num_rounds).unwrap();
         let ot_protocol = DistributedSilentOt::new(ot_params);
-        let mut ot_states: Vec<_> =
-            (0..n).map(|i| ot_protocol.init_party(i, &mut rng)).collect();
+        let mut ot_states: Vec<_> = (0..n)
+            .map(|i| ot_protocol.init_party(i, &mut rng))
+            .collect();
 
         let mut r0 = vec![Vec::new(); n];
         for s in ot_states.iter() {
@@ -531,10 +576,7 @@ mod tests {
         }
         let him_elapsed = him_start.elapsed();
         eprintln!("HIM generation: {:.2?}", him_elapsed);
-        eprintln!(
-            "total: {:.2?}",
-            ot_elapsed + him_elapsed
-        );
+        eprintln!("total: {:.2?}", ot_elapsed + him_elapsed);
 
         assert_eq!(all_party_shares.len(), n);
         for shares in &all_party_shares {
@@ -543,7 +585,11 @@ mod tests {
 
         let verify_start = std::time::Instant::now();
         assert!(RanDouShaProtocol::verify(&all_party_shares, n, t).unwrap());
-        eprintln!("verified {} double shares in {:.2?}", count, verify_start.elapsed());
+        eprintln!(
+            "verified {} double shares in {:.2?}",
+            count,
+            verify_start.elapsed()
+        );
     }
 
     #[test]
@@ -569,8 +615,9 @@ mod tests {
         let ot_start = std::time::Instant::now();
         let ot_params = SilentOtParams::new(n, t, num_rounds).unwrap();
         let ot_protocol = DistributedSilentOt::new(ot_params);
-        let mut ot_states: Vec<_> =
-            (0..n).map(|i| ot_protocol.init_party(i, &mut rng)).collect();
+        let mut ot_states: Vec<_> = (0..n)
+            .map(|i| ot_protocol.init_party(i, &mut rng))
+            .collect();
 
         let mut r0 = vec![Vec::new(); n];
         for s in ot_states.iter() {
@@ -649,7 +696,8 @@ mod tests {
                 let mut local_rng = ChaCha20Rng::seed_from_u64(round_seeds[batch_start]);
 
                 for round in batch_start..batch_end {
-                    let secrets: [Fp; 5] = std::array::from_fn(|i| ot_correlations[i].get_random(round));
+                    let secrets: [Fp; 5] =
+                        std::array::from_fn(|i| ot_correlations[i].get_random(round));
 
                     // Generate random coefficients for all sharings
                     // Degree-t (t=1): each secret has 1 random coeff
@@ -678,8 +726,14 @@ mod tests {
                             let val_t = a + eval_points_t[p] * b_t;
                             let val_2t = a + eval_points_2t[p] * b1_2t + eval_pt2_sq[p] * b2_2t;
                             out.push((
-                                Share { point: eval_points_t[p], value: val_t },
-                                Share { point: eval_points_2t[p], value: val_2t },
+                                Share {
+                                    point: eval_points_t[p],
+                                    value: val_t,
+                                },
+                                Share {
+                                    point: eval_points_2t[p],
+                                    value: val_2t,
+                                },
                             ));
                         }
                     }
@@ -710,10 +764,7 @@ mod tests {
         }
         let him_elapsed = him_start.elapsed();
         eprintln!("HIM generation: {:.2?}", him_elapsed);
-        eprintln!(
-            "offline total (OT + HIM): {:.2?}",
-            ot_elapsed + him_elapsed
-        );
+        eprintln!("offline total (OT + HIM): {:.2?}", ot_elapsed + him_elapsed);
 
         let verify_start = std::time::Instant::now();
         let sample_size = 1000;

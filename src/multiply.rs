@@ -57,11 +57,7 @@ impl DnMultiply {
         }
     }
 
-    pub fn verify_king_broadcast(
-        &self,
-        masked_shares: &[Share],
-        claimed_value: Fp,
-    ) -> Result<()> {
+    pub fn verify_king_broadcast(&self, masked_shares: &[Share], claimed_value: Fp) -> Result<()> {
         if masked_shares.len() < 2 * self.t + 1 {
             return Err(ProtocolError::MultiplyError(format!(
                 "need >= {} masked shares for verification, got {}",
@@ -134,7 +130,9 @@ pub fn multiply_sequence(
         if vs.len() != n {
             return Err(ProtocolError::InvalidParams(format!(
                 "value_shares[{}] has {} shares, expected {}",
-                idx, vs.len(), n
+                idx,
+                vs.len(),
+                n
             )));
         }
     }
@@ -142,7 +140,9 @@ pub fn multiply_sequence(
         if ds.len() != n {
             return Err(ProtocolError::InvalidParams(format!(
                 "double_shares[{}] has {} shares, expected {}",
-                idx, ds.len(), n
+                idx,
+                ds.len(),
+                n
             )));
         }
     }
@@ -225,6 +225,92 @@ pub fn multiply_sequence_party_indexed(
     Ok(current)
 }
 
+/// DN multiply: batch opening of multiple independent masked products.
+///
+/// Opens `k` degree-2t masked products in a single Lagrange reconstruction pass.
+/// In a distributed protocol, this corresponds to one broadcast round for all `k` values.
+///
+/// Returns the `k` opened values.
+pub fn dn_batch_open(n: usize, t: usize, masked_shares_batch: &[Vec<Share>]) -> Result<Vec<Fp>> {
+    let shamir_2t = Shamir::new(n, 2 * t)?;
+    let lagrange = shamir_2t.lagrange_coefficients();
+    let mut opened = Vec::with_capacity(masked_shares_batch.len());
+    for shares in masked_shares_batch {
+        if shares.len() != n {
+            return Err(ProtocolError::InvalidParams(format!(
+                "expected {} shares, got {}",
+                n,
+                shares.len()
+            )));
+        }
+        let val: Fp = shares.iter().zip(lagrange).map(|(s, &c)| s.value * c).sum();
+        opened.push(val);
+    }
+    Ok(opened)
+}
+
+/// Multiply a sequence of independent (x, y) pairs using DN protocol with batched openings.
+///
+/// Each multiplication is independent — all masked products can be opened in
+/// ⌈k / (n−2t)⌉ broadcast rounds instead of k rounds.
+///
+/// `x_shares[k][p]` and `y_shares[k][p]` are the k-th pair's inputs.
+/// `party_double_shares[p][k]` is party p's double share for the k-th multiplication.
+/// Returns `result[k][p]` = party p's share of x_k · y_k.
+pub fn dn_multiply_independent_batched(
+    n: usize,
+    t: usize,
+    x_shares: &[Vec<Share>],
+    y_shares: &[Vec<Share>],
+    party_double_shares: &[Vec<DoubleShare>],
+) -> Result<Vec<Vec<Share>>> {
+    let k = x_shares.len();
+    if k == 0 {
+        return Ok(Vec::new());
+    }
+    if y_shares.len() != k {
+        return Err(ProtocolError::InvalidParams(format!(
+            "mismatched batch: x={}, y={}",
+            k,
+            y_shares.len()
+        )));
+    }
+    if party_double_shares.len() != n {
+        return Err(ProtocolError::InvalidParams(format!(
+            "expected {} party vectors, got {}",
+            n,
+            party_double_shares.len()
+        )));
+    }
+
+    // Compute all masked shares locally
+    let masked_batch: Vec<Vec<Share>> = (0..k)
+        .map(|i| {
+            (0..n)
+                .map(|p| {
+                    DnMultiply::compute_masked_share(
+                        &x_shares[i][p],
+                        &y_shares[i][p],
+                        &party_double_shares[p][i],
+                    )
+                })
+                .collect()
+        })
+        .collect();
+
+    // Batch open all masked products (in real distributed: ⌈k/(n-2t)⌉ rounds)
+    let opened = dn_batch_open(n, t, &masked_batch)?;
+
+    // Compute output shares
+    Ok((0..k)
+        .map(|i| {
+            (0..n)
+                .map(|p| DnMultiply::compute_output_share(opened[i], &party_double_shares[p][i]))
+                .collect()
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,7 +338,9 @@ mod tests {
         let double_shares: Vec<DoubleShare> = (0..n).map(|p| party_ds[p][0].clone()).collect();
 
         let dn = DnMultiply::new(n, t, 0).unwrap();
-        let result_shares = dn.multiply_local(&x_shares, &y_shares, &double_shares).unwrap();
+        let result_shares = dn
+            .multiply_local(&x_shares, &y_shares, &double_shares)
+            .unwrap();
 
         let result = shamir_t.reconstruct(&result_shares).unwrap();
         assert_eq!(result, expected);
@@ -269,7 +357,9 @@ mod tests {
         let y_shares = shamir_t.share(Fp::ZERO, &mut rng);
 
         let params = RanDouShaParams::new(n, t, 1).unwrap();
-        let party_ds = RanDouShaProtocol::new(params).generate_local(&mut rng).unwrap();
+        let party_ds = RanDouShaProtocol::new(params)
+            .generate_local(&mut rng)
+            .unwrap();
         let ds: Vec<DoubleShare> = (0..n).map(|p| party_ds[p][0].clone()).collect();
 
         let dn = DnMultiply::new(n, t, 0).unwrap();
@@ -289,11 +379,15 @@ mod tests {
         let expected: Fp = values.iter().copied().reduce(|a, b| a * b).unwrap();
         assert_eq!(expected, Fp::new(120));
 
-        let value_shares: Vec<Vec<Share>> =
-            values.iter().map(|v| shamir_t.share(*v, &mut rng)).collect();
+        let value_shares: Vec<Vec<Share>> = values
+            .iter()
+            .map(|v| shamir_t.share(*v, &mut rng))
+            .collect();
 
         let params = RanDouShaParams::new(n, t, values.len() - 1).unwrap();
-        let party_ds = RanDouShaProtocol::new(params).generate_local(&mut rng).unwrap();
+        let party_ds = RanDouShaProtocol::new(params)
+            .generate_local(&mut rng)
+            .unwrap();
         let double_shares: Vec<Vec<DoubleShare>> = (0..(values.len() - 1))
             .map(|k| (0..n).map(|p| party_ds[p][k].clone()).collect())
             .collect();
@@ -318,7 +412,9 @@ mod tests {
         let y_shares = shamir_t.share(y, &mut rng);
 
         let params = RanDouShaParams::new(n, t, 1).unwrap();
-        let party_ds = RanDouShaProtocol::new(params).generate_local(&mut rng).unwrap();
+        let party_ds = RanDouShaProtocol::new(params)
+            .generate_local(&mut rng)
+            .unwrap();
         let ds: Vec<DoubleShare> = (0..n).map(|p| party_ds[p][0].clone()).collect();
 
         let dn = DnMultiply::new(n, t, 0).unwrap();
@@ -338,11 +434,15 @@ mod tests {
         let values: Vec<Fp> = (2..2 + num_values as u64).map(Fp::new).collect();
         let expected: Fp = values.iter().copied().reduce(|a, b| a * b).unwrap();
 
-        let value_shares: Vec<Vec<Share>> =
-            values.iter().map(|v| shamir_t.share(*v, &mut rng)).collect();
+        let value_shares: Vec<Vec<Share>> = values
+            .iter()
+            .map(|v| shamir_t.share(*v, &mut rng))
+            .collect();
 
         let params = RanDouShaParams::new(n, t, num_values - 1).unwrap();
-        let party_ds = RanDouShaProtocol::new(params).generate_local(&mut rng).unwrap();
+        let party_ds = RanDouShaProtocol::new(params)
+            .generate_local(&mut rng)
+            .unwrap();
         let double_shares: Vec<Vec<DoubleShare>> = (0..(num_values - 1))
             .map(|k| (0..n).map(|p| party_ds[p][k].clone()).collect())
             .collect();
@@ -363,11 +463,15 @@ mod tests {
         let values: Vec<Fp> = (1..=num_values as u64).map(Fp::new).collect();
         let expected: Fp = values.iter().copied().reduce(|a, b| a * b).unwrap();
 
-        let value_shares: Vec<Vec<Share>> =
-            values.iter().map(|v| shamir_t.share(*v, &mut rng)).collect();
+        let value_shares: Vec<Vec<Share>> = values
+            .iter()
+            .map(|v| shamir_t.share(*v, &mut rng))
+            .collect();
 
         let params = RanDouShaParams::new(n, t, num_values - 1).unwrap();
-        let party_ds = RanDouShaProtocol::new(params).generate_local(&mut rng).unwrap();
+        let party_ds = RanDouShaProtocol::new(params)
+            .generate_local(&mut rng)
+            .unwrap();
         let double_shares: Vec<Vec<DoubleShare>> = (0..(num_values - 1))
             .map(|k| (0..n).map(|p| party_ds[p][k].clone()).collect())
             .collect();
@@ -391,7 +495,9 @@ mod tests {
         let y_shares = shamir_t.share(y, &mut rng);
 
         let params = RanDouShaParams::new(n, t, 1).unwrap();
-        let party_ds = RanDouShaProtocol::new(params).generate_local(&mut rng).unwrap();
+        let party_ds = RanDouShaProtocol::new(params)
+            .generate_local(&mut rng)
+            .unwrap();
         let ds: Vec<DoubleShare> = (0..n).map(|p| party_ds[p][0].clone()).collect();
 
         let masked_shares: Vec<Share> = (0..n)
@@ -417,7 +523,9 @@ mod tests {
         let y_shares = shamir_t.share(y, &mut rng);
 
         let params = RanDouShaParams::new(n, t, 1).unwrap();
-        let party_ds = RanDouShaProtocol::new(params).generate_local(&mut rng).unwrap();
+        let party_ds = RanDouShaProtocol::new(params)
+            .generate_local(&mut rng)
+            .unwrap();
         let ds: Vec<DoubleShare> = (0..n).map(|p| party_ds[p][0].clone()).collect();
 
         let masked_shares: Vec<Share> = (0..n)
@@ -437,5 +545,71 @@ mod tests {
     fn test_invalid_params() {
         assert!(DnMultiply::new(5, 1, 5).is_err());
         assert!(DnMultiply::new(2, 1, 0).is_err());
+    }
+
+    #[test]
+    fn test_dn_independent_batched() {
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let n = 5;
+        let t = 1;
+        let shamir_t = Shamir::new(n, t).unwrap();
+
+        let num_mults = 10;
+        let x_vals: Vec<Fp> = (2..2 + num_mults as u64).map(Fp::new).collect();
+        let y_vals: Vec<Fp> = (10..10 + num_mults as u64).map(Fp::new).collect();
+
+        let x_shares: Vec<Vec<Share>> = x_vals
+            .iter()
+            .map(|&v| shamir_t.share(v, &mut rng))
+            .collect();
+        let y_shares: Vec<Vec<Share>> = y_vals
+            .iter()
+            .map(|&v| shamir_t.share(v, &mut rng))
+            .collect();
+
+        let params = RanDouShaParams::new(n, t, num_mults).unwrap();
+        let party_ds = RanDouShaProtocol::new(params)
+            .generate_local(&mut rng)
+            .unwrap();
+
+        let results =
+            dn_multiply_independent_batched(n, t, &x_shares, &y_shares, &party_ds).unwrap();
+        assert_eq!(results.len(), num_mults);
+
+        for i in 0..num_mults {
+            let result = shamir_t.reconstruct(&results[i]).unwrap();
+            assert_eq!(result, x_vals[i] * y_vals[i], "DN batched mult {} wrong", i);
+        }
+    }
+
+    #[test]
+    fn test_dn_batched_matches_sequential() {
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let n = 5;
+        let t = 1;
+        let shamir_t = Shamir::new(n, t).unwrap();
+
+        let x = Fp::new(7);
+        let y = Fp::new(6);
+        let x_shares = shamir_t.share(x, &mut rng);
+        let y_shares = shamir_t.share(y, &mut rng);
+
+        let params = RanDouShaParams::new(n, t, 1).unwrap();
+        let party_ds = RanDouShaProtocol::new(params)
+            .generate_local(&mut rng)
+            .unwrap();
+
+        // Sequential
+        let dn = DnMultiply::new(n, t, 0).unwrap();
+        let ds: Vec<DoubleShare> = (0..n).map(|p| party_ds[p][0].clone()).collect();
+        let seq = dn.multiply_local(&x_shares, &y_shares, &ds).unwrap();
+
+        // Batched
+        let batched =
+            dn_multiply_independent_batched(n, t, &[x_shares], &[y_shares], &party_ds).unwrap();
+
+        for p in 0..n {
+            assert_eq!(seq[p].value, batched[0][p].value, "party {} mismatch", p);
+        }
     }
 }

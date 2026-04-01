@@ -328,9 +328,18 @@ mod tests {
     #[test]
     fn test_duplicate_points_detected() {
         let shares = vec![
-            Share { point: Fp::new(1), value: Fp::new(10) },
-            Share { point: Fp::new(1), value: Fp::new(20) },
-            Share { point: Fp::new(3), value: Fp::new(30) },
+            Share {
+                point: Fp::new(1),
+                value: Fp::new(10),
+            },
+            Share {
+                point: Fp::new(1),
+                value: Fp::new(20),
+            },
+            Share {
+                point: Fp::new(3),
+                value: Fp::new(30),
+            },
         ];
         let result = lagrange_interpolate_at_zero(&shares);
         assert!(result.is_err());

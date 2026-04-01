@@ -7,9 +7,7 @@ use silent_ot_randousha::randousha::{
     DoubleShare, HyperInvertibleMatrix, RanDouShaParams, RanDouShaProtocol,
 };
 use silent_ot_randousha::shamir::{Shamir, Share};
-use silent_ot_randousha::silent_ot::{
-    Block, DistributedSilentOt, SilentOtParams,
-};
+use silent_ot_randousha::silent_ot::{Block, DistributedSilentOt, SilentOtParams};
 
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -60,12 +58,7 @@ impl BufferedNet {
             .await
     }
 
-    async fn broadcast<T: Serialize>(
-        &self,
-        phase: u32,
-        round: u32,
-        msg: &T,
-    ) -> Result<(), String> {
+    async fn broadcast<T: Serialize>(&self, phase: u32, round: u32, msg: &T) -> Result<(), String> {
         let payload = bincode::serialize(msg).map_err(|e| e.to_string())?;
         self.inner
             .broadcast(&TaggedMessage {
@@ -91,8 +84,7 @@ impl BufferedNet {
         loop {
             let (from, tagged): (usize, TaggedMessage) = self.inner.recv().await?;
             if tagged.phase == phase && tagged.round == round {
-                let msg: T =
-                    bincode::deserialize(&tagged.payload).map_err(|e| e.to_string())?;
+                let msg: T = bincode::deserialize(&tagged.payload).map_err(|e| e.to_string())?;
                 return Ok((from, msg));
             }
             self.buffer.push((from, tagged));
@@ -239,8 +231,7 @@ async fn run_party(net: PartyNetwork, party_id: usize) -> Option<Fp> {
         let next_share = my_input_shares[mult_idx + 1];
         let ds = &my_double_shares[mult_idx];
 
-        let masked =
-            DnMultiply::compute_masked_share(&current_share, &next_share, ds);
+        let masked = DnMultiply::compute_masked_share(&current_share, &next_share, ds);
 
         let phase = 3;
         let round = (mult_idx * 2) as u32;
@@ -251,8 +242,7 @@ async fn run_party(net: PartyNetwork, party_id: usize) -> Option<Fp> {
 
         let opened_value: Fp;
         if party_id == KING {
-            let received: HashMap<usize, Share> =
-                net.recv_from_all(phase, round).await.unwrap();
+            let received: HashMap<usize, Share> = net.recv_from_all(phase, round).await.unwrap();
             let mut all_masked = vec![masked];
             for (_, s) in received {
                 all_masked.push(s);
@@ -366,8 +356,7 @@ async fn test_networked_randousha_verification() {
                 }
 
                 for k in 0..num_ds {
-                    let shares_t: Vec<Share> =
-                        (0..N).map(|p| all_party_ds[p][k].share_t).collect();
+                    let shares_t: Vec<Share> = (0..N).map(|p| all_party_ds[p][k].share_t).collect();
                     let shares_2t: Vec<Share> =
                         (0..N).map(|p| all_party_ds[p][k].share_2t).collect();
                     let secret_t = shamir_t.reconstruct(&shares_t).unwrap();
@@ -475,8 +464,7 @@ async fn test_networked_mass_chained_multiplication() {
                 }
             } else {
                 for v_idx in 0..num_values {
-                    let (_, share): (usize, Share) =
-                        bnet.recv(2, v_idx as u32).await.unwrap();
+                    let (_, share): (usize, Share) = bnet.recv(2, v_idx as u32).await.unwrap();
                     my_input_shares.push(share);
                 }
             }
@@ -485,8 +473,7 @@ async fn test_networked_mass_chained_multiplication() {
             for mult_idx in 0..num_mults {
                 let next = my_input_shares[mult_idx + 1];
                 let ds = &double_shares[mult_idx];
-                let masked =
-                    DnMultiply::compute_masked_share(&current, &next, ds);
+                let masked = DnMultiply::compute_masked_share(&current, &next, ds);
 
                 let phase = 3;
                 let round = (mult_idx * 2) as u32;
@@ -507,8 +494,7 @@ async fn test_networked_mass_chained_multiplication() {
                     opened = dn.king_reconstruct(&all_masked).unwrap();
                     bnet.broadcast(phase, round + 1, &opened).await.unwrap();
                 } else {
-                    let (_, val): (usize, Fp) =
-                        bnet.recv(phase, round + 1).await.unwrap();
+                    let (_, val): (usize, Fp) = bnet.recv(phase, round + 1).await.unwrap();
                     opened = val;
                 }
 
@@ -519,8 +505,7 @@ async fn test_networked_mass_chained_multiplication() {
                 bnet.send(0, 4, 0, &current).await.unwrap();
                 None
             } else {
-                let received: HashMap<usize, Share> =
-                    bnet.recv_from_all(4, 0).await.unwrap();
+                let received: HashMap<usize, Share> = bnet.recv_from_all(4, 0).await.unwrap();
                 let mut all_shares = vec![current];
                 for (_, s) in received {
                     all_shares.push(s);
@@ -562,8 +547,7 @@ async fn run_offline_online_multiply(
     let num_him_rounds = num_mults.div_ceil(sharings_per_round);
     let him = HyperInvertibleMatrix::new(N);
 
-    let ot_randoms =
-        run_silent_ot_setup_n(&mut bnet, party_id, &mut rng, num_him_rounds).await;
+    let ot_randoms = run_silent_ot_setup_n(&mut bnet, party_id, &mut rng, num_him_rounds).await;
 
     let mut double_shares: Vec<DoubleShare> = Vec::with_capacity(num_mults);
 
@@ -684,8 +668,7 @@ async fn run_offline_online_multiply(
 
         let opened: Fp;
         if party_id == KING {
-            let received: HashMap<usize, Share> =
-                bnet.recv_from_all(phase, round).await.unwrap();
+            let received: HashMap<usize, Share> = bnet.recv_from_all(phase, round).await.unwrap();
             let mut all_masked = vec![masked];
             for (_, s) in received {
                 all_masked.push(s);
@@ -739,9 +722,9 @@ async fn test_mass_chained_offline_multiply_with_reveal_20() {
     let mut handles = Vec::new();
     for (party_id, net) in networks.into_iter().enumerate() {
         let vals = values.clone();
-        handles.push(tokio::spawn(
-            run_offline_online_multiply(net, party_id, vals, 128),
-        ));
+        handles.push(tokio::spawn(run_offline_online_multiply(
+            net, party_id, vals, 128,
+        )));
     }
 
     let mut results = Vec::new();
@@ -750,8 +733,15 @@ async fn test_mass_chained_offline_multiply_with_reveal_20() {
     }
 
     let result = results[0].expect("Party 0 should produce result");
-    assert_eq!(result, expected, "20-value chained multiply: {} != {}", result, expected);
-    eprintln!("=== PASSED: 20-value chained offline multiply+reveal = {} ===", result);
+    assert_eq!(
+        result, expected,
+        "20-value chained multiply: {} != {}",
+        result, expected
+    );
+    eprintln!(
+        "=== PASSED: 20-value chained offline multiply+reveal = {} ===",
+        result
+    );
 }
 
 #[tokio::test]
@@ -760,16 +750,19 @@ async fn test_mass_chained_offline_multiply_with_reveal_50() {
     let values: Vec<Fp> = (1..=num_values as u64).map(Fp::new).collect();
     let expected: Fp = values.iter().copied().reduce(|a, b| a * b).unwrap();
 
-    eprintln!("=== Mass offline multiply+reveal: {} values ({}!) ===", num_values, num_values);
+    eprintln!(
+        "=== Mass offline multiply+reveal: {} values ({}!) ===",
+        num_values, num_values
+    );
 
     let networks = setup_tcp_network(N, 17600).await;
 
     let mut handles = Vec::new();
     for (party_id, net) in networks.into_iter().enumerate() {
         let vals = values.clone();
-        handles.push(tokio::spawn(
-            run_offline_online_multiply(net, party_id, vals, 128),
-        ));
+        handles.push(tokio::spawn(run_offline_online_multiply(
+            net, party_id, vals, 128,
+        )));
     }
 
     let mut results = Vec::new();
@@ -779,7 +772,10 @@ async fn test_mass_chained_offline_multiply_with_reveal_50() {
 
     let result = results[0].expect("Party 0 should produce result");
     assert_eq!(result, expected, "50!: {} != {}", result, expected);
-    eprintln!("=== PASSED: 50-value chained offline multiply+reveal = {} ===", result);
+    eprintln!(
+        "=== PASSED: 50-value chained offline multiply+reveal = {} ===",
+        result
+    );
 }
 
 #[tokio::test]
@@ -788,7 +784,13 @@ async fn test_offline_online_separation_with_reveal() {
 
     let networks = setup_tcp_network(N, 17700).await;
 
-    let values = vec![Fp::new(13), Fp::new(17), Fp::new(19), Fp::new(23), Fp::new(29)];
+    let values = vec![
+        Fp::new(13),
+        Fp::new(17),
+        Fp::new(19),
+        Fp::new(23),
+        Fp::new(29),
+    ];
     let expected: Fp = values.iter().copied().reduce(|a, b| a * b).unwrap();
     let expected_plain = 13u64 * 17 * 19 * 23 * 29;
     assert_eq!(expected, Fp::new(expected_plain));
@@ -797,9 +799,9 @@ async fn test_offline_online_separation_with_reveal() {
     let mut handles = Vec::new();
     for (party_id, net) in networks.into_iter().enumerate() {
         let vals = values.clone();
-        handles.push(tokio::spawn(
-            run_offline_online_multiply(net, party_id, vals, 128),
-        ));
+        handles.push(tokio::spawn(run_offline_online_multiply(
+            net, party_id, vals, 128,
+        )));
     }
 
     let mut results = Vec::new();
@@ -809,7 +811,10 @@ async fn test_offline_online_separation_with_reveal() {
 
     let result = results[0].expect("Party 0 should produce result");
     assert_eq!(result, expected);
-    eprintln!("=== PASSED: offline/online separation test = {} ===", result);
+    eprintln!(
+        "=== PASSED: offline/online separation test = {} ===",
+        result
+    );
 }
 
 #[tokio::test]
@@ -871,7 +876,8 @@ async fn test_malicious_king_detection() {
     let dn = DnMultiply::new(n, t, 0).unwrap();
     let honest_opened = dn.king_reconstruct(&masked_shares).unwrap();
 
-    dn.verify_king_broadcast(&masked_shares, honest_opened).unwrap();
+    dn.verify_king_broadcast(&masked_shares, honest_opened)
+        .unwrap();
     eprintln!("  Honest king broadcast: VERIFIED");
 
     let malicious_opened = honest_opened + Fp::new(1);
@@ -892,19 +898,24 @@ async fn test_malicious_king_detection() {
 #[tokio::test]
 async fn test_mass_chained_offline_multiply_with_reveal_100() {
     let num_values = 100;
-    let values: Vec<Fp> = (0..num_values).map(|i| Fp::new((i % 7 + 2) as u64)).collect();
+    let values: Vec<Fp> = (0..num_values)
+        .map(|i| Fp::new((i % 7 + 2) as u64))
+        .collect();
     let expected: Fp = values.iter().copied().reduce(|a, b| a * b).unwrap();
 
-    eprintln!("=== Mass offline multiply+reveal: {} values ===", num_values);
+    eprintln!(
+        "=== Mass offline multiply+reveal: {} values ===",
+        num_values
+    );
 
     let networks = setup_tcp_network(N, 17800).await;
 
     let mut handles = Vec::new();
     for (party_id, net) in networks.into_iter().enumerate() {
         let vals = values.clone();
-        handles.push(tokio::spawn(
-            run_offline_online_multiply(net, party_id, vals, 128),
-        ));
+        handles.push(tokio::spawn(run_offline_online_multiply(
+            net, party_id, vals, 128,
+        )));
     }
 
     let mut results = Vec::new();
@@ -913,8 +924,15 @@ async fn test_mass_chained_offline_multiply_with_reveal_100() {
     }
 
     let result = results[0].expect("Party 0 should produce result");
-    assert_eq!(result, expected, "100-value multiply failed: {} != {}", result, expected);
-    eprintln!("=== PASSED: 100-value chained offline multiply+reveal = {} ===", result);
+    assert_eq!(
+        result, expected,
+        "100-value multiply failed: {} != {}",
+        result, expected
+    );
+    eprintln!(
+        "=== PASSED: 100-value chained offline multiply+reveal = {} ===",
+        result
+    );
 }
 
 #[tokio::test]
@@ -979,8 +997,7 @@ async fn test_chained_multiply_with_intermediate_reveals() {
                 }
             } else {
                 for v_idx in 0..num_values {
-                    let (_, share): (usize, Share) =
-                        bnet.recv(2, v_idx as u32).await.unwrap();
+                    let (_, share): (usize, Share) = bnet.recv(2, v_idx as u32).await.unwrap();
                     my_input_shares.push(share);
                 }
             }
@@ -1012,8 +1029,7 @@ async fn test_chained_multiply_with_intermediate_reveals() {
                     opened = dn.king_reconstruct(&all_masked).unwrap();
                     bnet.broadcast(phase, round + 1, &opened).await.unwrap();
                 } else {
-                    let (_, val): (usize, Fp) =
-                        bnet.recv(phase, round + 1).await.unwrap();
+                    let (_, val): (usize, Fp) = bnet.recv(phase, round + 1).await.unwrap();
                     opened = val;
                 }
 
@@ -1049,14 +1065,13 @@ async fn test_chained_multiply_with_intermediate_reveals() {
     }
 
     let intermediates = party_results[0].as_ref().unwrap();
-    let expected_intermediates = [
-        Fp::new(6),
-        Fp::new(30),
-        Fp::new(210),
-        Fp::new(2310),
-    ];
+    let expected_intermediates = [Fp::new(6), Fp::new(30), Fp::new(210), Fp::new(2310)];
 
-    for (i, (got, exp)) in intermediates.iter().zip(expected_intermediates.iter()).enumerate() {
+    for (i, (got, exp)) in intermediates
+        .iter()
+        .zip(expected_intermediates.iter())
+        .enumerate()
+    {
         assert_eq!(
             *got, *exp,
             "intermediate result {} mismatch: {} != {}",
@@ -1070,18 +1085,23 @@ async fn test_chained_multiply_with_intermediate_reveals() {
 #[tokio::test]
 async fn test_mass_chained_offline_multiply_200() {
     let num_values = 200;
-    let values: Vec<Fp> = (0..num_values).map(|i| Fp::new((i % 7 + 2) as u64)).collect();
+    let values: Vec<Fp> = (0..num_values)
+        .map(|i| Fp::new((i % 7 + 2) as u64))
+        .collect();
     let expected: Fp = values.iter().copied().reduce(|a, b| a * b).unwrap();
 
-    eprintln!("=== Mass offline multiply+reveal: {} values ===", num_values);
+    eprintln!(
+        "=== Mass offline multiply+reveal: {} values ===",
+        num_values
+    );
 
     let networks = setup_tcp_network(N, 18000).await;
     let mut handles = Vec::new();
     for (party_id, net) in networks.into_iter().enumerate() {
         let vals = values.clone();
-        handles.push(tokio::spawn(
-            run_offline_online_multiply(net, party_id, vals, 0),
-        ));
+        handles.push(tokio::spawn(run_offline_online_multiply(
+            net, party_id, vals, 0,
+        )));
     }
 
     let mut results = Vec::new();
@@ -1090,25 +1110,34 @@ async fn test_mass_chained_offline_multiply_200() {
     }
 
     let result = results[0].expect("Party 0 should produce result");
-    assert_eq!(result, expected, "200-value multiply: {} != {}", result, expected);
+    assert_eq!(
+        result, expected,
+        "200-value multiply: {} != {}",
+        result, expected
+    );
     eprintln!("=== PASSED: 200-value chained offline multiply+reveal ===");
 }
 
 #[tokio::test]
 async fn test_mass_chained_offline_multiply_500() {
     let num_values = 500;
-    let values: Vec<Fp> = (0..num_values).map(|i| Fp::new((i % 11 + 2) as u64)).collect();
+    let values: Vec<Fp> = (0..num_values)
+        .map(|i| Fp::new((i % 11 + 2) as u64))
+        .collect();
     let expected: Fp = values.iter().copied().reduce(|a, b| a * b).unwrap();
 
-    eprintln!("=== Mass offline multiply+reveal: {} values ===", num_values);
+    eprintln!(
+        "=== Mass offline multiply+reveal: {} values ===",
+        num_values
+    );
 
     let networks = setup_tcp_network(N, 18100).await;
     let mut handles = Vec::new();
     for (party_id, net) in networks.into_iter().enumerate() {
         let vals = values.clone();
-        handles.push(tokio::spawn(
-            run_offline_online_multiply(net, party_id, vals, 0),
-        ));
+        handles.push(tokio::spawn(run_offline_online_multiply(
+            net, party_id, vals, 0,
+        )));
     }
 
     let mut results = Vec::new();
@@ -1117,25 +1146,34 @@ async fn test_mass_chained_offline_multiply_500() {
     }
 
     let result = results[0].expect("Party 0 should produce result");
-    assert_eq!(result, expected, "500-value multiply: {} != {}", result, expected);
+    assert_eq!(
+        result, expected,
+        "500-value multiply: {} != {}",
+        result, expected
+    );
     eprintln!("=== PASSED: 500-value chained offline multiply+reveal ===");
 }
 
 #[tokio::test]
 async fn test_mass_chained_offline_multiply_1000() {
     let num_values = 1000;
-    let values: Vec<Fp> = (0..num_values).map(|i| Fp::new((i % 13 + 2) as u64)).collect();
+    let values: Vec<Fp> = (0..num_values)
+        .map(|i| Fp::new((i % 13 + 2) as u64))
+        .collect();
     let expected: Fp = values.iter().copied().reduce(|a, b| a * b).unwrap();
 
-    eprintln!("=== Mass offline multiply+reveal: {} values ===", num_values);
+    eprintln!(
+        "=== Mass offline multiply+reveal: {} values ===",
+        num_values
+    );
 
     let networks = setup_tcp_network(N, 18200).await;
     let mut handles = Vec::new();
     for (party_id, net) in networks.into_iter().enumerate() {
         let vals = values.clone();
-        handles.push(tokio::spawn(
-            run_offline_online_multiply(net, party_id, vals, 0),
-        ));
+        handles.push(tokio::spawn(run_offline_online_multiply(
+            net, party_id, vals, 0,
+        )));
     }
 
     let mut results = Vec::new();
@@ -1144,7 +1182,11 @@ async fn test_mass_chained_offline_multiply_1000() {
     }
 
     let result = results[0].expect("Party 0 should produce result");
-    assert_eq!(result, expected, "1000-value multiply: {} != {}", result, expected);
+    assert_eq!(
+        result, expected,
+        "1000-value multiply: {} != {}",
+        result, expected
+    );
     eprintln!("=== PASSED: 1000-value chained offline multiply+reveal ===");
 }
 
@@ -1160,9 +1202,9 @@ async fn test_him_check_row_verification_networked() {
     let mut handles = Vec::new();
     for (party_id, net) in networks.into_iter().enumerate() {
         let vals = values.clone();
-        handles.push(tokio::spawn(
-            run_offline_online_multiply(net, party_id, vals, 0),
-        ));
+        handles.push(tokio::spawn(run_offline_online_multiply(
+            net, party_id, vals, 0,
+        )));
     }
 
     let mut results = Vec::new();
@@ -1172,5 +1214,330 @@ async fn test_him_check_row_verification_networked() {
 
     let result = results[0].expect("Party 0 should produce result");
     assert_eq!(result, expected, "10!: {} != {}", result, expected);
-    eprintln!("=== PASSED: HIM check row verification over network, 10! = {} ===", result);
+    eprintln!(
+        "=== PASSED: HIM check row verification over network, 10! = {} ===",
+        result
+    );
+}
+
+// ── Distributed Fibonacci with Streaming Triples ───────────────────────
+//
+// Each party provides a private input. The inputs are summed to produce
+// the starting value x = Σ input_p. Then we compute a multiplicative
+// Fibonacci sequence: F(0)=1, F(1)=x, F(k) = F(k-1) * F(k-2).
+//
+// The entire computation is done on secret-shared values:
+//   - Addition of shares is free (no communication)
+//   - Multiplication uses Beaver triples from the streaming generator
+//   - Only the final result is revealed
+//
+// Phases:
+//   0: Silent OT setup (2-round protocol)
+//   1: Input sharing (each party shares its input with all others)
+//   2: Online multiplications (Beaver multiply with streamed triples)
+//   3: Reveal final result to party 0
+
+/// A single party's role in the distributed private Fibonacci computation.
+///
+/// Fully peer-to-peer: no king, no single point of trust. Every party is
+/// symmetric. Each party runs this function independently, communicating
+/// with all other parties over TCP.
+///
+/// Protocol:
+///   Phase 0 (offline): Silent OT (2-round) → HIM double share generation
+///                       → convert double shares to Beaver triples (p2p)
+///   Phase 1 (input):   Each party secret-shares its input to all others
+///   Phase 2 (compute): Multiplicative Fibonacci using p2p Beaver multiply
+///                       (all-to-all broadcast of d_p, e_p — no king)
+///   Phase 3 (reveal):  All parties broadcast final shares, all reconstruct
+async fn run_fibonacci_party(
+    net: PartyNetwork,
+    party_id: usize,
+    my_input: Fp,
+    fib_steps: usize,
+) -> Option<Fp> {
+    let start = std::time::Instant::now();
+    let mut rng = ChaCha20Rng::seed_from_u64(party_id as u64 + 9000);
+    let mut bnet = BufferedNet::new(net);
+    let shamir_t = Shamir::new(N, T).unwrap();
+    let shamir_2t = Shamir::new(N, 2 * T).unwrap();
+    let num_mults = fib_steps.saturating_sub(1);
+    let spr = N - 2 * T;
+    let num_him_rounds = if num_mults > 0 {
+        num_mults.div_ceil(spr)
+    } else {
+        1
+    };
+    let him = HyperInvertibleMatrix::new(N);
+
+    eprintln!(
+        "[Party {}] starting with private input={}, {} Fibonacci steps",
+        party_id, my_input, fib_steps
+    );
+
+    // ── Phase 0: Offline — Silent OT (2-round) + Beaver triples ─────
+    let offline_start = std::time::Instant::now();
+
+    let ot_params = SilentOtParams::new(N, T, std::cmp::max(num_him_rounds, 16)).unwrap();
+    let protocol = DistributedSilentOt::new(ot_params);
+    let mut ot_state = protocol.init_party(party_id, &mut rng);
+
+    // OT Round A: each party sends (commitment, puncture_index) to every peer
+    for (to, commitment, punct_idx) in DistributedSilentOt::round_a_messages(&ot_state) {
+        bnet.send(to, 0, 0, &(commitment, punct_idx)).await.unwrap();
+    }
+    let ra_recv: HashMap<usize, ([u8; 32], usize)> = bnet.recv_from_all(0, 0).await.unwrap();
+    let ra: Vec<_> = ra_recv.into_iter().map(|(f, (c, i))| (f, c, i)).collect();
+    DistributedSilentOt::process_round_a(&mut ot_state, &ra).unwrap();
+
+    // OT Round B: each party sends (sibling_path, seed) to every peer
+    for (to, path, seed) in DistributedSilentOt::round_b_messages(&ot_state).unwrap() {
+        bnet.send(to, 0, 1, &(path, seed)).await.unwrap();
+    }
+    let rb_recv: HashMap<usize, (Vec<Block>, Block)> = bnet.recv_from_all(0, 1).await.unwrap();
+    let rb: Vec<_> = rb_recv.into_iter().map(|(f, (p, s))| (f, p, s)).collect();
+    DistributedSilentOt::process_round_b(&mut ot_state, &rb).unwrap();
+
+    // Expand OT correlations locally (no communication)
+    let correlations = DistributedSilentOt::expand(&ot_state).unwrap();
+    let ot_randoms: Vec<Fp> = (0..num_him_rounds)
+        .map(|k| correlations.get_random(k))
+        .collect();
+
+    // Generate double shares via distributed HIM mixing (all-to-all per round)
+    let mut double_shares: Vec<DoubleShare> = Vec::with_capacity(num_mults);
+    for him_round in 0..num_him_rounds {
+        let secret = ot_randoms[him_round];
+        let st = shamir_t.share(secret, &mut rng);
+        let s2t = shamir_2t.share(secret, &mut rng);
+
+        for j in 0..N {
+            if j != party_id {
+                bnet.send(j, 1, him_round as u32, &(st[j], s2t[j]))
+                    .await
+                    .unwrap();
+            }
+        }
+        let received: HashMap<usize, (Share, Share)> =
+            bnet.recv_from_all(1, him_round as u32).await.unwrap();
+
+        let mut input_t = vec![Fp::ZERO; N];
+        let mut input_2t = vec![Fp::ZERO; N];
+        input_t[party_id] = st[party_id].value;
+        input_2t[party_id] = s2t[party_id].value;
+        for (&from, (s, s2)) in &received {
+            input_t[from] = s.value;
+            input_2t[from] = s2.value;
+        }
+
+        let out_t = him.mul_vec(&input_t);
+        let out_2t = him.mul_vec(&input_2t);
+
+        for j in 0..spr {
+            if double_shares.len() >= num_mults {
+                break;
+            }
+            double_shares.push(DoubleShare {
+                share_t: Share {
+                    point: shamir_t.eval_points[party_id],
+                    value: out_t[j],
+                },
+                share_2t: Share {
+                    point: shamir_2t.eval_points[party_id],
+                    value: out_2t[j],
+                },
+            });
+        }
+    }
+
+    let my_point = shamir_t.eval_points[party_id];
+
+    eprintln!(
+        "[Party {}] offline phase complete: {} double shares in {:.2?}",
+        party_id,
+        double_shares.len(),
+        offline_start.elapsed()
+    );
+
+    // ── Phase 1: Each party secret-shares its private input ─────────
+    let my_shares = shamir_t.share(my_input, &mut rng);
+    for j in 0..N {
+        if j != party_id {
+            bnet.send(j, 2, 0, &my_shares[j]).await.unwrap();
+        }
+    }
+    let input_received: HashMap<usize, Share> = bnet.recv_from_all(2, 0).await.unwrap();
+    let mut all_input_shares = vec![my_shares[party_id]; N];
+    for (&from, &share) in &input_received {
+        all_input_shares[from] = share;
+    }
+
+    // Sum all inputs locally (addition is free — no communication needed)
+    let x_share = Share {
+        point: shamir_t.eval_points[party_id],
+        value: all_input_shares
+            .iter()
+            .map(|s| s.value)
+            .fold(Fp::ZERO, |a, b| a + b),
+    };
+
+    eprintln!(
+        "[Party {}] received shares from all peers, summed inputs locally",
+        party_id
+    );
+
+    // ── Phase 2: P2P multiplication (no king) ─────────────────────
+    // F(0) = 1, F(1) = x, F(k) = F(k-1) * F(k-2)
+    //
+    // Each multiplication uses a double share and all-to-all broadcast:
+    //   1. Party p computes: masked_p = F_curr_p * F_prev_p + r_2t_p
+    //   2. Party p broadcasts masked_p to ALL peers
+    //   3. Every party locally reconstructs: opened = Σ lag[p] * masked_p
+    //   4. Party p computes: F_next_p = opened - r_t_p
+    //
+    // Fully symmetric — no king, no single point of trust.
+
+    let one_share = Share {
+        point: my_point,
+        value: Fp::ONE,
+    };
+
+    let lagrange_2t = shamir_2t.lagrange_coefficients();
+    let mut f_prev = one_share;
+    let mut f_curr = x_share;
+
+    let online_start = std::time::Instant::now();
+    for k in 0..num_mults {
+        let ds = &double_shares[k];
+
+        // Masked product: degree-2t share of F_curr * F_prev
+        let my_masked = f_curr.value * f_prev.value + ds.share_2t.value;
+
+        // Broadcast to ALL peers (no king)
+        bnet.broadcast(3, k as u32, &my_masked).await.unwrap();
+        let masked_recv: HashMap<usize, Fp> = bnet.recv_from_all(3, k as u32).await.unwrap();
+
+        // Every party reconstructs the opened value locally via Lagrange
+        let mut opened = lagrange_2t[party_id] * my_masked;
+        for (&from, &val) in &masked_recv {
+            opened += lagrange_2t[from] * val;
+        }
+
+        // Output share: subtract degree-t component
+        let f_next = Share {
+            point: my_point,
+            value: opened - ds.share_t.value,
+        };
+
+        f_prev = f_curr;
+        f_curr = f_next;
+    }
+
+    eprintln!(
+        "[Party {}] computed F({}) via {} p2p multiplications in {:.2?}",
+        party_id,
+        fib_steps,
+        num_mults,
+        online_start.elapsed()
+    );
+
+    // ── Phase 3: Reveal final result (all-to-all, everyone learns it) ──
+    bnet.broadcast(4, 0, &f_curr).await.unwrap();
+    let reveal_received: HashMap<usize, Share> = bnet.recv_from_all(4, 0).await.unwrap();
+    let mut all_shares = vec![f_curr];
+    for (_, s) in reveal_received {
+        all_shares.push(s);
+    }
+    let result = shamir_t.reconstruct(&all_shares).unwrap();
+
+    eprintln!(
+        "[Party {}] revealed result: F({}) = {}, total time: {:.2?}",
+        party_id,
+        fib_steps,
+        result,
+        start.elapsed()
+    );
+    Some(result)
+}
+
+/// Distributed private Fibonacci computation over TCP peer-to-peer network.
+///
+/// 5 parties on separate TCP ports, each with a private input:
+///   Party 0: 3, Party 1: 5, Party 2: 7, Party 3: 11, Party 4: 13
+///
+/// The protocol privately computes:
+///   x = 3 + 5 + 7 + 11 + 13 = 39  (sum of all inputs)
+///   F(0) = 1, F(1) = 39
+///   F(k) = F(k-1) * F(k-2)  (multiplicative Fibonacci)
+///
+/// No party learns any intermediate value. Only the final F(n) is revealed.
+#[tokio::test]
+async fn test_distributed_fibonacci_streaming() {
+    let inputs = vec![Fp::new(3), Fp::new(5), Fp::new(7), Fp::new(11), Fp::new(13)];
+    let fib_steps = 8;
+
+    // Compute expected result in plaintext for verification
+    let x = inputs.iter().copied().fold(Fp::ZERO, |a, b| a + b);
+    let mut fp = Fp::ONE;
+    let mut fc = x;
+    for _ in 0..fib_steps - 1 {
+        let next = fc * fp;
+        fp = fc;
+        fc = next;
+    }
+    let expected = fc;
+
+    eprintln!("╔══════════════════════════════════════════════════════╗");
+    eprintln!("║  Distributed Private Fibonacci over TCP P2P Network ║");
+    eprintln!("╠══════════════════════════════════════════════════════╣");
+    eprintln!(
+        "║  Parties: {} (threshold t={})                        ║",
+        N, T
+    );
+    eprintln!(
+        "║  Inputs: {:?}            ║",
+        inputs.iter().map(|f| f.val()).collect::<Vec<_>>()
+    );
+    eprintln!("║  Sum: x = {}                                        ║", x);
+    eprintln!(
+        "║  Computing: F({}) where F(k)=F(k-1)*F(k-2)          ║",
+        fib_steps
+    );
+    eprintln!("║  Expected: F({}) = {}          ║", fib_steps, expected);
+    eprintln!("╚══════════════════════════════════════════════════════╝");
+
+    // Create TCP mesh network: 5 parties on ports 18400-18404
+    let networks = setup_tcp_network(N, 18400).await;
+
+    // Launch each party as an independent async task (simulates separate machines)
+    let mut handles = Vec::new();
+    for (party_id, net) in networks.into_iter().enumerate() {
+        let input = inputs[party_id];
+        handles.push(tokio::spawn(run_fibonacci_party(
+            net, party_id, input, fib_steps,
+        )));
+    }
+
+    // Wait for all parties to complete — every party learns the result
+    let mut results = Vec::new();
+    for handle in handles {
+        results.push(handle.await.unwrap());
+    }
+
+    // Every party should have reconstructed the same result
+    for (p, result) in results.iter().enumerate() {
+        let val = result.expect(&format!("Party {} should have result", p));
+        assert_eq!(
+            val, expected,
+            "Party {} got wrong result: {} expected {}",
+            p, val, expected
+        );
+    }
+
+    eprintln!("╔══════════════════════════════════════════════════════╗");
+    eprintln!(
+        "║  PASSED: All {} parties agree F({}) = {:>16} ║",
+        N, fib_steps, expected
+    );
+    eprintln!("╚══════════════════════════════════════════════════════╝");
 }

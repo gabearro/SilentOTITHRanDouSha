@@ -5,7 +5,9 @@ use rayon::prelude::*;
 
 use silent_ot_randousha::field::Fp;
 use silent_ot_randousha::multiply::multiply_sequence_party_indexed;
-use silent_ot_randousha::randousha::{DoubleShare, HyperInvertibleMatrix, RanDouShaParams, RanDouShaProtocol};
+use silent_ot_randousha::randousha::{
+    DoubleShare, HyperInvertibleMatrix, RanDouShaParams, RanDouShaProtocol,
+};
 use silent_ot_randousha::shamir::{Shamir, Share};
 use silent_ot_randousha::silent_ot::{
     batch_to_field_elements, prg_expand, Block, DistributedSilentOt, GgmTree, SilentOtParams,
@@ -55,11 +57,9 @@ fn bench_batch_to_field_elements(c: &mut Criterion) {
     for count in [1024, 65536, 666_667] {
         let mut rng = ChaCha20Rng::seed_from_u64(42);
         let blocks: Vec<Block> = (0..count).map(|_| Block::random(&mut rng)).collect();
-        group.bench_with_input(
-            BenchmarkId::new("convert", count),
-            &count,
-            |b, &count| b.iter(|| black_box(batch_to_field_elements(&blocks, count))),
-        );
+        group.bench_with_input(BenchmarkId::new("convert", count), &count, |b, &count| {
+            b.iter(|| black_box(batch_to_field_elements(&blocks, count)))
+        });
     }
 
     group.finish();
@@ -89,9 +89,7 @@ fn bench_him_multiply(c: &mut Criterion) {
     let him = HyperInvertibleMatrix::new(5);
     let v: Vec<Fp> = (1..=5u64).map(Fp::new).collect();
 
-    group.bench_function("n5", |b| {
-        b.iter(|| black_box(him.mul_vec(&v)))
-    });
+    group.bench_function("n5", |b| b.iter(|| black_box(him.mul_vec(&v))));
 
     group.finish();
 }
@@ -327,9 +325,13 @@ fn bench_multiply_sequence(c: &mut Criterion) {
         let mut rng = ChaCha20Rng::seed_from_u64(42);
         let num_values = num_mults + 1;
 
-        let values: Vec<Fp> = (0..num_values).map(|i| Fp::new((i % 7 + 2) as u64)).collect();
-        let value_shares: Vec<Vec<Share>> =
-            values.iter().map(|v| shamir_t.share(*v, &mut rng)).collect();
+        let values: Vec<Fp> = (0..num_values)
+            .map(|i| Fp::new((i % 7 + 2) as u64))
+            .collect();
+        let value_shares: Vec<Vec<Share>> = values
+            .iter()
+            .map(|v| shamir_t.share(*v, &mut rng))
+            .collect();
 
         let params = RanDouShaParams::new(n, t, num_mults).unwrap();
         let protocol = RanDouShaProtocol::new(params);
@@ -354,9 +356,7 @@ fn bench_multiply_sequence(c: &mut Criterion) {
 
 fn bench_prg_expand(c: &mut Criterion) {
     let seed = Block::random(&mut ChaCha20Rng::seed_from_u64(42));
-    c.bench_function("prg_expand", |b| {
-        b.iter(|| black_box(prg_expand(&seed)))
-    });
+    c.bench_function("prg_expand", |b| b.iter(|| black_box(prg_expand(&seed))));
 }
 
 fn bench_fp_arithmetic(c: &mut Criterion) {
@@ -364,12 +364,8 @@ fn bench_fp_arithmetic(c: &mut Criterion) {
     let a = Fp::new(123456789);
     let b = Fp::new(987654321);
 
-    group.bench_function("mul", |b_| {
-        b_.iter(|| black_box(a * b))
-    });
-    group.bench_function("add", |b_| {
-        b_.iter(|| black_box(a + b))
-    });
+    group.bench_function("mul", |b_| b_.iter(|| black_box(a * b)));
+    group.bench_function("add", |b_| b_.iter(|| black_box(a + b)));
 
     group.finish();
 }
@@ -397,8 +393,7 @@ fn bench_beaver_triple_gen(c: &mut Criterion) {
                 b.iter(|| {
                     let mut rng = ChaCha20Rng::seed_from_u64(99);
                     black_box(
-                        generate_triples_from_party_indexed(n, t, &party_ds, &mut rng)
-                            .unwrap(),
+                        generate_triples_from_party_indexed(n, t, &party_ds, &mut rng).unwrap(),
                     )
                 })
             },
@@ -429,8 +424,7 @@ fn bench_beaver_e2e(c: &mut Criterion) {
                         .generate_local(&mut rng)
                         .unwrap();
                     black_box(
-                        generate_triples_from_party_indexed(n, t, &party_ds, &mut rng)
-                            .unwrap(),
+                        generate_triples_from_party_indexed(n, t, &party_ds, &mut rng).unwrap(),
                     )
                 })
             },
@@ -458,8 +452,9 @@ fn bench_beaver_fused(c: &mut Criterion) {
         let mut rng = ChaCha20Rng::seed_from_u64(42);
         let ot_params = SilentOtParams::new(n, t, num_rounds).unwrap();
         let ot_protocol = DistributedSilentOt::new(ot_params);
-        let mut ot_states: Vec<_> =
-            (0..n).map(|i| ot_protocol.init_party(i, &mut rng)).collect();
+        let mut ot_states: Vec<_> = (0..n)
+            .map(|i| ot_protocol.init_party(i, &mut rng))
+            .collect();
 
         let mut r0 = vec![Vec::new(); n];
         for s in ot_states.iter() {
@@ -510,8 +505,7 @@ fn bench_beaver_fused(c: &mut Criterion) {
                 b.iter(|| {
                     let mut rng = ChaCha20Rng::seed_from_u64(99);
                     black_box(
-                        generate_triples_from_ot(n, t, count, &ot_correlations, &mut rng)
-                            .unwrap(),
+                        generate_triples_from_ot(n, t, count, &ot_correlations, &mut rng).unwrap(),
                     )
                 })
             },
@@ -540,8 +534,9 @@ fn bench_beaver_fused_batch(c: &mut Criterion) {
         let mut rng = ChaCha20Rng::seed_from_u64(42);
         let ot_params = SilentOtParams::new(n, t, num_rounds).unwrap();
         let ot_protocol = DistributedSilentOt::new(ot_params);
-        let mut ot_states: Vec<_> =
-            (0..n).map(|i| ot_protocol.init_party(i, &mut rng)).collect();
+        let mut ot_states: Vec<_> = (0..n)
+            .map(|i| ot_protocol.init_party(i, &mut rng))
+            .collect();
 
         let mut r0 = vec![Vec::new(); n];
         for s in ot_states.iter() {
@@ -603,6 +598,106 @@ fn bench_beaver_fused_batch(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_batched_multiply(c: &mut Criterion) {
+    use silent_ot_randousha::beaver::{
+        beaver_multiply_chain, beaver_multiply_chain_batched, beaver_multiply_independent_batched,
+        generate_triples,
+    };
+    use silent_ot_randousha::multiply::dn_multiply_independent_batched;
+
+    let mut group = c.benchmark_group("batched_multiply");
+    group.sample_size(10);
+
+    let n = 5;
+    let t = 1;
+    let shamir_t = Shamir::new(n, t).unwrap();
+
+    for num_values in [20, 100, 1000] {
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let values: Vec<Fp> = (2..2 + num_values as u64).map(Fp::new).collect();
+        let shares: Vec<Vec<Share>> = values
+            .iter()
+            .map(|&v| shamir_t.share(v, &mut rng))
+            .collect();
+
+        let params = RanDouShaParams::new(n, t, num_values - 1).unwrap();
+        let party_ds = RanDouShaProtocol::new(params)
+            .generate_local(&mut rng)
+            .unwrap();
+
+        // Generate triples for beaver multiply
+        let ds_transposed: Vec<Vec<DoubleShare>> = (0..num_values - 1)
+            .map(|k| (0..n).map(|p| party_ds[p][k].clone()).collect())
+            .collect();
+        let triples = generate_triples(n, t, &ds_transposed, &mut rng).unwrap();
+
+        group.bench_with_input(
+            BenchmarkId::new("chain_sequential", num_values),
+            &num_values,
+            |b, _| b.iter(|| black_box(beaver_multiply_chain(n, t, &shares, &triples).unwrap())),
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("chain_batched", num_values),
+            &num_values,
+            |b, _| {
+                b.iter(|| {
+                    black_box(beaver_multiply_chain_batched(n, t, &shares, &triples).unwrap())
+                })
+            },
+        );
+    }
+
+    // Independent batched multiply
+    for num_mults in [10, 100, 1000] {
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let x_shares: Vec<Vec<Share>> = (0..num_mults)
+            .map(|i| shamir_t.share(Fp::new(i as u64 + 2), &mut rng))
+            .collect();
+        let y_shares: Vec<Vec<Share>> = (0..num_mults)
+            .map(|i| shamir_t.share(Fp::new(i as u64 + 10), &mut rng))
+            .collect();
+
+        let params = RanDouShaParams::new(n, t, num_mults).unwrap();
+        let party_ds = RanDouShaProtocol::new(params)
+            .generate_local(&mut rng)
+            .unwrap();
+
+        let ds_transposed: Vec<Vec<DoubleShare>> = (0..num_mults)
+            .map(|k| (0..n).map(|p| party_ds[p][k].clone()).collect())
+            .collect();
+        let triples = generate_triples(n, t, &ds_transposed, &mut rng).unwrap();
+
+        group.bench_with_input(
+            BenchmarkId::new("independent_beaver_batched", num_mults),
+            &num_mults,
+            |b, _| {
+                b.iter(|| {
+                    black_box(
+                        beaver_multiply_independent_batched(n, t, &x_shares, &y_shares, &triples)
+                            .unwrap(),
+                    )
+                })
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("independent_dn_batched", num_mults),
+            &num_mults,
+            |b, _| {
+                b.iter(|| {
+                    black_box(
+                        dn_multiply_independent_batched(n, t, &x_shares, &y_shares, &party_ds)
+                            .unwrap(),
+                    )
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_fp_arithmetic,
@@ -620,5 +715,6 @@ criterion_group!(
     bench_beaver_e2e,
     bench_beaver_fused,
     bench_beaver_fused_batch,
+    bench_batched_multiply,
 );
 criterion_main!(benches);
